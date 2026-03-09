@@ -2,6 +2,10 @@
 
 A lightweight tool that uses an LLM agent to extract per-operator compute demand from LLM model configs. It generates CSV files containing FLOP counts, tensor shapes, and execution counts for each operator — ready to feed into [NeuSim](../NeuSim/) for hardware performance simulation.
 
+## Overview
+
+<img src="assets/flow.png" width="600">
+
 ## How It Works
 
 1. Reads a model config JSON (architecture params, parallelism degrees, batch size, etc.)
