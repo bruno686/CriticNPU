@@ -1,88 +1,114 @@
 # Multi-Agent System for NPU Architecture Design
 
-An LLM-driven NPU architecture design system. Given an LLM model structure and hardware constraints, it automatically designs optimal NPU chip configurations using a multi-agent system powered by GPT-4o and the [NeuSim](NeuSim/) performance simulator.
+A multi-agent system that automatically designs optimal NPU chip configurations for LLM inference. Three LLM agents collaborate with the [NeuSIM](NeuSim/) performance simulator to explore the hardware design space, achieving **19.6% better TTFT** than grid search while using **17x fewer simulations**.
 
 <img src="chip_agent/assets/flow.png" width="600">
 
-## System Overview
+---
 
-The system consists of **three LLM-powered agents** and a **cross-workload design memory**:
+## System Architecture
 
-- **Agent 1** (`computedemandagent.py`): Extracts per-operator compute demand from model configs
-- **Agent 2** (`bottleneck_analysis.py`): Diagnoses performance bottlenecks from NeuSIM results
-- **Agent 3** (`npudesignagent.py`): Iteratively designs NPU architecture using LLM + NeuSIM
+Given an LLM model (e.g., llama3-8b) and hardware constraints (power budget, HBM size, etc.), the system designs an NPU chip configuration that minimizes latency (TTFT / TPOT). Three agents work together in a pipeline:
 
 ```
-                    ┌─────────────────────────┐
-                    │  LLM Model Config JSON  │
-                    │ (llama3-8b, llama2-13b)  │
-                    └───────────┬──────────────┘
-                                │
-                                ▼
-                ┌───────────────────────────────┐
-                │  Agent 1: Compute Demand       │
-                │  (GPT-4o)                      │
-                │  Model config → per-operator   │
-                │  FLOPs, tensor shapes, counts  │
-                └───────────────┬────────────────┘
-                                │
-              ┌─────────────────┼──────────────────┐
-              │                 │                   │
-              ▼                 ▼                   ▼
-    ┌──────────────┐  ┌─────────────────┐  ┌──────────────────┐
-    │  Compute     │  │  Constraints    │  │  Design Memory   │
-    │  Demand CSV  │  │  (power, HBM,   │  │  (cross-workload │
-    │              │  │   ICI, area)    │  │   experiences)   │
-    └──────┬───────┘  └───────┬─────────┘  └────────┬─────────┘
-           │                  │                      │
-           └──────────────────┼──────────────────────┘
-                              │
-                              ▼
-               ┌──────────────────────────────┐
-               │  Agent 3: NPU Design         │
-               │  (GPT-4o)                    │
-               │  Proposes NPU config         │◄──────────────┐
-               └──────────────┬───────────────┘               │
-                              │                               │
-                              ▼                               │
-               ┌──────────────────────────────┐               │
-               │  NeuSIM Simulation           │               │
-               │  → TTFT, TPOT, Power, OOM    │               │
-               └──────────────┬───────────────┘               │
-                              │                               │
-                              ▼                               │
-               ┌──────────────────────────────┐               │
-               │  Agent 2: Bottleneck Analysis│               │
-               │  (GPT-4o)                    │               │
-               │  One-sentence bottleneck     │───────────────┘
-               │  diagnosis (facts only)      │  feedback loop
-               └──────────────────────────────┘  (max 50 iters)
+  LLM Model Config
+        │
+        ▼
+  ┌───────────────────────────┐
+  │  Agent 1: Compute Demand  │  Runs once before design starts.
+  │  Extracts per-operator    │  Output: per-op FLOPs, tensor shapes
+  │  workload profile         │
+  └─────────────┬─────────────┘
+                │
+                ▼
+  ┌───────────────────────────┐     ┌────────────────────────┐
+  │  Agent 3: NPU Design      │◄────│  Design Memory         │
+  │  Proposes chip config     │     │  Cross-workload         │
+  │  (num_sa, freq, ...)      │     │  experience retrieval   │
+  └─────────────┬─────────────┘     └────────────────────────┘
+                │                              ▲
+                ▼                              │
+  ┌───────────────────────────┐                │
+  │  NeuSIM Simulation        │                │
+  │  → TTFT, TPOT, Power, OOM │                │
+  └─────────────┬─────────────┘                │
+                │                              │
+                ▼                              │
+  ┌───────────────────────────┐                │
+  │  Agent 2: Bottleneck      │                │
+  │  Analysis                 │────────────────┘
+  │  One-sentence diagnosis   │     Store experience after
+  │  fed back to Agent 3      │     design completes
+  └───────────────────────────┘
+                │
+                └──► Iterate (max 50 rounds) until convergence
 ```
 
-| Agent | Role | LLM | Key Design Choice |
-|-------|------|-----|-------------------|
-| **Agent 1** | Extract per-operator compute demand | GPT-4o | Sharding-aware FLOP calculation with verification |
-| **Agent 2** | Diagnose bottleneck from NeuSIM results | GPT-4o | Facts only, no recommendations (prevents misleading Agent 3) |
-| **Agent 3** | Iteratively design NPU architecture | GPT-4o | Seed warm-start + LLM-guided search with power pre-check |
-| **Design Memory** | Store and retrieve cross-workload experiences | GPT-4o | Per-chip workload similarity + hierarchical memory (episodic + semantic) |
+| Agent | File | Role |
+|-------|------|------|
+| **Agent 1** | `computedemandagent.py` | Extract per-operator compute demand from model config |
+| **Agent 2** | `bottleneck_analysis.py` | Diagnose performance bottleneck from NeuSIM results |
+| **Agent 3** | `npudesignagent.py` | Iteratively design NPU architecture via LLM + NeuSIM loop |
+
+All three agents are powered by GPT-4o.
 
 ---
 
-## Method
+## Agent 1: Compute Demand Extraction
 
-### Problem Formulation
+**Purpose:** Analyze the LLM model structure and produce a per-operator workload profile that Agent 3 uses to understand what the chip needs to run.
 
-**Input:**
-- LLM model structure (e.g., llama3-8b: 32 layers, d_model=4096)
-- Hardware constraints: HBM bandwidth/size, ICI bandwidth, DCN bandwidth (upper bounds)
-- Power budget (e.g., 300W hard constraint)
-- Parallelism config: num_chips, TP, PP, DP, batch size
+**How it works:**
+1. Reads a model config JSON (layer count, hidden dims, attention heads, parallelism degrees)
+2. GPT-4o applies sharding formulas to compute per-operator demands under the given parallelism
+3. A Python-side verification pass recomputes FLOP counts and tensor shapes
+4. Outputs two CSV files: `inference_prefill.csv` and `inference_decode.csv`
 
-**Output:**
-- Optimal NPU chip configuration (num_sa, num_vu, sa_dim, freq_GHz, vmem_size_MB, ...)
-- Minimizing TTFT (Time To First Token) and/or TPOT (Time Per Output Token)
+**Output format** (each row = one operator):
 
-**Tunable Parameters:**
+| Column | Example |
+|--------|---------|
+| Description | `-Q-5`, `FlashAttention-6` |
+| Count | 32 |
+| FLOP Count | 2.15e+09 |
+| Input Tensor Shapes | `[16, 4096, 1024] bf16` |
+| Output Tensor Shapes | `[16, 4096, 1024] bf16` |
+
+---
+
+## Agent 2: Bottleneck Analysis
+
+**Purpose:** After each NeuSIM simulation, diagnose what is limiting performance so Agent 3 can make informed design decisions.
+
+**How it works:**
+1. Deterministic extraction: compute time breakdown (Compute / Memory / ICI %), SA utilization, HBM BW utilization, top-5 time-consuming operators
+2. GPT-4o summarizes the data into **one sentence** — the core bottleneck fact
+
+**Example output:**
+> "Prefill is 78% compute-bound with 42% SA utilization — SAs are under-utilized due to tile padding."
+
+### Why "facts only"?
+
+Agent 2's design went through three iterations. A key finding: **more analysis hurts performance** because detailed recommendations constrain Agent 3's exploration space.
+
+| Version | What Agent 2 outputs | Prefill TTFT |
+|---------|---------------------|-------------|
+| v1: Detailed | Multi-paragraph with parameter suggestions | 0.1859 s (+20.2%) |
+| v2: Concise | 2-3 sentences with parameter values | 0.1637 s (+5.8%) |
+| **v3: Facts only** | **One sentence, no recommendations** | **0.1495 s (-3.4%)** |
+| No Agent 2 | No bottleneck analysis | 0.1547 s (baseline) |
+
+Agent 2 is deliberately constrained: `temperature=0.1`, `max_tokens=80`, and the system prompt explicitly forbids words like "consider", "recommend", or "should". Agent 3 is the decision-maker.
+
+---
+
+## Agent 3: NPU Design
+
+**Purpose:** The main design agent. Iteratively proposes NPU chip configurations, evaluates them via NeuSIM, and converges to an optimal design.
+
+### Design Space
+
+**Tunable parameters:**
 
 | Parameter | Description | Range |
 |-----------|-------------|-------|
@@ -93,123 +119,85 @@ The system consists of **three LLM-powered agents** and a **cross-workload desig
 | `vmem_size_MB` | On-chip SRAM size | 32 - 512 MB |
 | Power params | Per-unit static/dynamic power | Varies |
 
-**Constraints:**
-- `total_power_peak_W ≤ power_budget` (hard constraint)
+**Hard constraints:**
+- `total_power_peak_W ≤ power_budget` (e.g., 300W)
 - `memory_footprint ≤ hbm_size_GB` (no OOM)
 - `hbm_bw_GBps`, `hbm_size_GB`, `ici_bw_GBps`, `dcn_bw_GBps` ≤ upper bounds
 
 ### Design Loop
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                                                                  │
-│  Step 1: SEED WARM-START                                         │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  9 diverse pre-defined configs spanning the design space   │  │
-│  │                                                            │  │
-│  │  min-compute ──► low-compute ──► balanced ──► high-compute │  │
-│  │  (2 SA, 0.5G)   (4 SA, 0.8G)   (8 SA, 1.0G)  (12 SA,1.2)│  │
-│  │                                                            │  │
-│  │  Each seed: run NeuSIM → record (TTFT, TPOT, Power, OOM)  │  │
-│  └────────────────────────────────┬───────────────────────────┘  │
-│                                   │                              │
-│                                   ▼                              │
-│  Step 2: LLM ITERATION LOOP (max 50 iterations)                 │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │                                                            │  │
-│  │  Agent 3 (GPT-4o) proposes config                         │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Duplicate detection → YES → reject, ask for new one      │  │
-│  │       │ NO                                                 │  │
-│  │       ▼                                                    │  │
-│  │  Fast power pre-check → FAIL → reject (no simulation)     │  │
-│  │       │ PASS                                               │  │
-│  │       ▼                                                    │  │
-│  │  NeuSIM simulation → TTFT, TPOT, Power, Memory            │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Agent 2 → one-sentence bottleneck diagnosis               │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Feedback to Agent 3 → next iteration                     │  │
-│  │       │                                                    │  │
-│  │  Converged? (10 iters < 2% change) → STOP                │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                   │                              │
-│                                   ▼                              │
-│  Step 3: REFLECT & STORE                                        │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  LLM reflects on trajectory → design lesson                │  │
-│  │  Store episode in cross-workload memory                    │  │
-│  │  Consolidate semantic principles (if ≥3 episodes)          │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
+**Step 1: Seed warm-start.** Evaluate 9 diverse pre-defined configs spanning the design space (from 2 SA / 0.5 GHz to 16 SA / 1.5 GHz). This maps the landscape and gives Agent 3 a strong starting point. Without seeds, GPT-4o tends to stay near default configs and misses counterintuitive regions (e.g., low frequency being optimal).
 
-### Agent 2: Bottleneck Analysis Design
+**Step 2: LLM iteration loop (max 50 rounds).** Each round:
+1. Agent 3 (GPT-4o) proposes a new config based on all previous results
+2. **Duplicate detection** — if the config was already tried, reject and ask for a new one
+3. **Fast power pre-check** — compute `total_power_peak_W` from the config analytically (~0.001s). If it exceeds the budget, reject instantly without running NeuSIM (~2s). Saves ~30% of iterations.
+4. **NeuSIM simulation** — run full simulation, get TTFT, TPOT, power, memory footprint
+5. **Agent 2 analysis** — one-sentence bottleneck diagnosis
+6. **Feedback** — all results + diagnosis fed back to Agent 3
 
-Agent 2 evolved through three iterations. A key finding: **more analysis hurts performance** because LLM architects are easily misled by detailed recommendations.
+Convergence: stop if the best score doesn't improve by >2% for 10 consecutive iterations.
 
-| Version | Output Style | Prefill TTFT | vs Baseline |
-|---------|-------------|-------------|-------------|
-| v1: Detailed recommendations | Multi-paragraph with parameter suggestions | 0.1859 s | +20.2% worse |
-| v2: Concise recommendations | 2-3 sentences with parameter values | 0.1637 s | +5.8% worse |
-| **v3: Facts only** | **One sentence, no recommendations** | **0.1495 s** | **-3.4% better** |
-| (no analysis) | No Agent 2 | 0.1547 s | baseline |
+**Step 3: Reflect & store.** After the loop completes, GPT-4o generates a design lesson from the trajectory, which is stored in the cross-workload design memory.
 
-The final design: Agent 2 reports **only bottleneck facts** (e.g., "Prefill is 78% compute-bound with 42% SA utilization — SAs are under-utilized due to tile padding.") and lets Agent 3 decide what to do. This prevents Agent 2 from constraining Agent 3's exploration space.
-
-### Cross-Workload Design Memory
-
-The memory module enables **experience transfer across workloads** — the key advantage of LLM-based design over Bayesian Optimization.
-
-**Architecture:**
-```
-DesignMemory
-├── Episodic Memory    — specific design runs with LLM-generated reflections
-│   e.g., "For llama3-8b prefill, low freq (0.6) + max SA count was optimal
-│          because power savings from low freq funded additional SAs"
-├── Semantic Memory    — general principles consolidated from multiple episodes
-│   e.g., "Lowering core frequency below 0.7 GHz frees enough power budget
-│          for 2-3 additional SAs, improving compute-bound workloads"
-└── Retrieval          — per-chip workload similarity (cosine on feature vectors)
-```
-
-**Workload similarity** is computed on per-chip features after parallelism sharding:
-- `d_ff / TP`, `num_heads / TP`, `num_layers / PP` (per-chip dimensions)
-- Arithmetic intensity (FLOP/byte ratio — compute vs memory bound indicator)
-- Architecture type (dense vs MoE)
-
-This correctly identifies that llama3-8b with TP=4 and llama3-70b with TP=8 have **identical per-chip workloads** (similarity=0.986) and should use the same NPU config — which matches our experimental results.
-
-### Disaggregated Serving Mode
+### Disaggregated Serving
 
 With `--disaggregated`, the system designs **two separate chips**:
-
 1. **Prefill chip** — optimized purely for TTFT (compute-bound)
 2. **Decode chip** — optimized purely for TPOT (memory-bound)
 
-Each chip runs the full design loop independently with appropriate optimization weights.
+Each chip runs the full design loop independently.
 
-### Key Design Decisions
+### Scoring
 
-| Mechanism | Why |
-|-----------|-----|
-| **Seed warm-start** | LLM tends to stay near default configs. Seeds force exploration of the full design space, especially low-frequency regions that are often optimal. |
-| **Fast power pre-check** | `ChipConfig.total_power_peak_W` is deterministic from config params (~0.001s vs ~2s for full simulation). Saves ~30% of wasted iterations. |
-| **Duplicate detection** | GPT-4o often re-proposes the same config in long conversations. Hash-based detection catches this instantly. |
-| **Facts-only analysis** | Detailed LLM recommendations consistently hurt Agent 3's search quality by constraining its exploration space. |
-| **Context trimming** | Keep system prompt + last 15 iteration pairs + best-so-far summary to stay within token limits. |
-
-### Scoring Function
-
-For combined optimization:
 ```
-score = ttft_weight × (TTFT / baseline_TTFT) + tpot_weight × (TPOT / baseline_TPOT)
+score = ttft_weight * (TTFT / baseline_TTFT) + tpot_weight * (TPOT / baseline_TPOT)
 ```
-Where `baseline_TTFT` and `baseline_TPOT` come from the first valid configuration found. Lower score = better.
+
+Lower is better. Baseline comes from the first valid seed config.
+
+---
+
+## Cross-Workload Design Memory
+
+**Purpose:** Enable experience transfer across workloads — the key advantage of LLM-based design over Bayesian Optimization.
+
+### Architecture
+
+```
+DesignMemory
+├── Episodic Memory    Specific design runs with LLM-generated reflections
+│     "For llama3-8b prefill, low freq (0.6 GHz) + max SA count was optimal
+│      because power savings from low freq funded additional SAs."
+│
+├── Semantic Memory    General principles consolidated from multiple episodes
+│     "Lowering core frequency below 0.7 GHz frees enough power budget for
+│      2-3 additional SAs, improving compute-bound workloads."
+│
+└── Retrieval          Per-chip workload similarity (cosine on feature vectors)
+```
+
+### How it works
+
+**After each design run:**
+1. GPT-4o reflects on the design trajectory and generates a concise lesson (2-3 sentences)
+2. The episode (workload features, best config, results, reflection) is stored in episodic memory
+3. When ≥3 episodes exist, GPT-4o consolidates them into general semantic principles
+
+**Before a new design run:**
+1. Extract per-chip workload features from the model config and parallelism settings
+2. Retrieve the most similar past episodes by cosine similarity
+3. Inject retrieved experiences (episodic + semantic) into Agent 3's initial context
+
+### Per-Chip Workload Similarity
+
+The key insight: **optimal NPU config depends on per-chip workload, not model size**. After parallelism sharding:
+- llama3-8b with TP=4: per-chip d_ff = 14336/4 = **3584**, heads = 32/4 = **8**
+- llama3-70b with TP=8: per-chip d_ff = 28672/8 = **3584**, heads = 64/8 = **8**
+
+Same per-chip workload → same optimal config. Our experiments confirm this (both converge to num_sa=9, sa_dim=256, freq≈0.6 GHz).
+
+Similarity features: `d_ff/TP`, `num_heads/TP`, `num_layers/PP`, `d_head`, `arithmetic_intensity`, `batch_size`, `is_moe`.
 
 ---
 
@@ -219,70 +207,67 @@ All experiments: power budget = 300W, disaggregated mode (separate prefill & dec
 
 ### llama3-8b (8 chips, TP=4, PP=2, BS=16)
 
-#### Agent Variants Comparison (Prefill TTFT)
+**Agent variants comparison (Prefill TTFT):**
 
 | Method | TTFT | vs Grid Search | Simulations |
 |--------|------|----------------|-------------|
-| Grid Search | 0.1859 s | baseline | 1440 |
-| Agent (no analysis) | 0.1547 s | **-16.8%** | ~82 |
-| Agent + detailed analysis (v1) | 0.1859 s | +0.0% | ~82 |
-| Agent + concise analysis (v2) | 0.1637 s | -11.9% | ~82 |
-| **Agent + facts-only analysis (v3)** | **0.1495 s** | **-19.6%** | **~82** |
+| Grid Search (720 configs) | 0.1859 s | baseline | 1440 |
+| Agent (no Agent 2) | 0.1547 s | -16.8% | ~82 |
+| Agent + Agent 2 v1 (detailed) | 0.1859 s | +0.0% | ~82 |
+| Agent + Agent 2 v2 (concise) | 0.1637 s | -11.9% | ~82 |
+| **Agent + Agent 2 v3 (facts only)** | **0.1495 s** | **-19.6%** | **~82** |
 
-#### Best Results: Agent (v3) vs Grid Search
+**Best results (Agent v3 vs Grid Search):**
 
-| | Grid Search | Agent (v3) | Improvement |
-|---|---|---|---|
-| **Prefill TTFT** | 0.1859 s | **0.1495 s** | **-19.6%** |
-| **Decode TPOT** | 7.2406 ms | **4.5256 ms** | **-37.5%** |
-| **Simulations run** | 1440 | **~82** | **17.6x fewer** |
+| Metric | Grid Search | Agent (v3) | Improvement |
+|--------|-------------|------------|-------------|
+| Prefill TTFT | 0.1859 s | **0.1495 s** | **-19.6%** |
+| Decode TPOT | 7.2406 ms | **4.5256 ms** | **-37.5%** |
+| Simulations | 1440 | ~82 | **17.6x fewer** |
 
-Best prefill chip config:
+**Best prefill chip config:**
 
 | Parameter | Grid Search | Agent (v3) |
 |-----------|-------------|------------|
 | num_sa | 8 | **9** |
 | sa_dim | 256 | 256 |
 | freq_GHz | 0.8 | **0.6** |
-| num_vu | 6 | **6** |
+| num_vu | 6 | 6 |
 | vmem_size_MB | 128 | **256** |
 | Peak Power | 277 W | **295 W** |
 
 ### llama2-13b (8 chips, TP=4, PP=2, BS=1)
 
-| | Grid Search | Agent | Improvement |
-|---|---|---|---|
-| **Prefill TTFT** | 0.0373 s | **0.0286 s** | **-23.3%** |
-| **Decode TPOT** | 6.3353 ms | **3.9597 ms** | **-37.5%** |
-| **Simulations run** | 1440 | **55** | **26.2x fewer** |
+| Metric | Grid Search | Agent | Improvement |
+|--------|-------------|-------|-------------|
+| Prefill TTFT | 0.0373 s | **0.0286 s** | **-23.3%** |
+| Decode TPOT | 6.3353 ms | **3.9597 ms** | **-37.5%** |
+| Simulations | 1440 | 55 | **26.2x fewer** |
 
 ### llama3-70b (16 chips, TP=8, PP=2, BS=16)
 
-| | Agent (v3) |
-|---|---|
-| **Prefill TTFT** | **0.6086 s** |
-| **Decode TPOT** | **17.3315 ms** |
+| Metric | Agent (v3) |
+|--------|------------|
+| Prefill TTFT | 0.6086 s |
+| Decode TPOT | 17.3315 ms |
+| Best prefill config | num_sa=9, sa_dim=256, freq=0.59 GHz, vmem=420 MB, Power=293 W |
 
-Best prefill config: num_sa=9, sa_dim=256, freq_GHz=0.59, vmem_size_MB=420, Peak Power=293W
+**Cross-workload finding:** llama3-8b (TP=4) and llama3-70b (TP=8) converge to nearly identical configs because their per-chip workloads are the same after sharding. This validates the per-chip similarity metric used in the design memory.
 
-**Cross-workload observation:** llama3-8b (TP=4) and llama3-70b (TP=8) converge to nearly identical optimal configs because their per-chip workloads are the same after parallelism sharding (d_ff/TP=3584, heads/TP=8). This validates the per-chip workload similarity metric used in the design memory.
+### Key Findings
 
-### Summary
+1. **Better configs** — the agent explores continuous parameter values outside the grid (e.g., num_sa=9, freq=0.54 GHz) that grid search cannot reach
+2. **17-26x fewer simulations** — seed warm-start + LLM-guided search + power pre-check avoids wasted evaluations
+3. **Full power budget utilization** — Agent configs land at ~295-299 W (just under 300 W budget), while grid search peaks at 277 W
+4. **Facts-only bottleneck analysis is optimal** — detailed recommendations from Agent 2 constrain Agent 3's exploration; one-sentence facts let Agent 3 make its own decisions
 
-The multi-agent system consistently:
-
-1. **Finds better configs** — explores parameter values outside the grid (e.g., `num_sa=9`, `freq_GHz=0.54`) that grid search cannot reach
-2. **Uses 17-26x fewer simulations** — seed warm-start + LLM-guided search + power pre-check avoids wasted evaluations
-3. **Maximizes power budget utilization** — Agent configs land at ~295-299W (just under 300W budget), while grid search best configs only reach 277W
-4. **Facts-only analysis outperforms detailed analysis** — Agent 2 v3 (one-sentence diagnosis) achieves the best results, while detailed recommendations (v1, v2) hurt performance
-
-> **Note:** Decode TPOT improvements below `freq_GHz=0.8` are partly influenced by a NeuSIM tile-shape selection artifact where execution time scales linearly with frequency for memory-bound operations.
+> **Note:** Decode TPOT improvements below freq=0.8 GHz are partly influenced by a NeuSIM tile-shape selection artifact where execution time scales linearly with frequency for memory-bound operations.
 
 ---
 
 ## Baseline: Grid Search
 
-`baseline_grid.py` provides a brute-force grid search baseline for comparison:
+`baseline_grid.py` provides a brute-force baseline:
 
 ```
 Search grid (720 combinations):
@@ -293,89 +278,69 @@ Search grid (720 combinations):
   vmem_size_MB: [128, 256, 384]
 ```
 
-Same constraints, same scoring, same power budget. Fixed HBM/ICI/DCN at max values.
+Same constraints, same scoring, same power budget.
 
 ---
 
-## Setup
+## Setup & Usage
+
+### Setup
 
 ```bash
 pip install pandas openai python-dotenv matplotlib
 ```
 
-Create a `.env` file with your OpenAI API key:
-
+Create `chip_agent/.env`:
 ```
 OPENAI_API_KEY=sk-...
 ```
 
-## Usage
+### Usage
 
-All commands should be run from the `chip_agent/` directory:
+All commands run from `chip_agent/`:
 
 ```bash
 cd chip_agent
-```
 
-### Full Pipeline (Recommended)
-
-`main.py` runs the full multi-agent pipeline: Agent 1 → Agent 2 → Agent 3, with cross-workload memory enabled by default:
-
-```bash
-# Basic run
-python main.py llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300
-
-# Disaggregated mode (separate prefill & decode chips)
+# Full pipeline (recommended)
 python main.py llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300 --disaggregated
 
-# Reuse existing Agent 1 results (skip re-extraction)
-python main.py llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300 --skip-agent1
+# Skip Agent 1 (reuse existing compute demand CSVs)
+python main.py llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300 --disaggregated --skip-agent1
 
-# Disable cross-workload memory (for ablation)
+# Disable design memory (for ablation)
 python main.py llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300 --no-memory
-```
 
-Or via shell script: `./main.sh llama3-8b --tp 4 --pp 2 --bs 16 --num-chips 8 --power-budget 300`
-
-### Run Agents Individually
-
-```bash
-# Agent 1: Compute Demand Extraction
+# Run agents individually
 python computedemandagent.py ../NeuSim/configs/models/llama3-8b.json --tp 4 --pp 2 --bs 16
-
-# Agent 3: NPU Design (with Agent 1 output as input)
 python npudesignagent.py llama3-8b --chip-version 4 --num-chips 8 \
   --tp 4 --pp 2 --bs 16 --power-budget 300 --disaggregated \
   --compute-demand-dir results/llama3-8b/dp1-tp4-pp2-dpdcn1-tpdcn1-ppdcn1-bs16
-```
 
-### Baseline: Grid Search
-
-```bash
+# Grid search baseline
 python baseline_grid.py llama3-8b --chip-version 4 --num-chips 8 \
   --tp 4 --pp 2 --bs 16 --power-budget 300 --disaggregated
-```
 
-### Plot Results
-
-```bash
+# Plot design iterations
 python plot_iterations.py design_results/<run_dir>/history.json [output.png]
 ```
+
+---
 
 ## Project Structure
 
 ```
 chip_agent/
 ├── main.py                # Unified entry point: Agent 1 → Agent 2 → Agent 3
-├── main.sh                # Shell wrapper for main.py
+├── main.sh                # Shell wrapper
 ├── computedemandagent.py  # Agent 1: compute demand extraction (GPT-4o)
 ├── bottleneck_analysis.py # Agent 2: bottleneck analysis (GPT-4o)
 ├── npudesignagent.py      # Agent 3: NPU architecture design (GPT-4o + NeuSIM)
 ├── design_memory.py       # Cross-workload design memory (episodic + semantic)
 ├── neusim_runner.py       # NeuSIM simulation wrapper (Python API)
-├── baseline_grid.py       # Grid search baseline for comparison
+├── baseline_grid.py       # Grid search baseline
 ├── plot_iterations.py     # Visualization of design iterations
-├── design_results/        # Output directory for Agent 3 runs
+├── design_results/        # Output directory for design runs
 ├── design_memory/         # Persistent cross-workload memory store
 ├── results/               # Pre-generated compute demand CSVs
 └── .env                   # OpenAI API key (not committed)
