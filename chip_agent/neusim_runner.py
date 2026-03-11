@@ -252,6 +252,9 @@ def run_simulation(
         # raw stats for debugging
         "prefill_stats": prefill_stats,
         "decode_stats": decode_stats,
+        # per-operator data for bottleneck analysis
+        "prefill_ops": prefill_ops,
+        "decode_ops": decode_ops,
     }
 
 

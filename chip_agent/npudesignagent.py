@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -24,6 +25,13 @@ from neusim_runner import (
     format_results,
     load_base_configs,
     run_simulation,
+)
+from bottleneck_analysis import run_analysis
+from design_memory import (
+    DesignMemory,
+    extract_workload_features,
+    generate_reflection,
+    _summarize_trajectory,
 )
 from neusim.configs.chips.ChipConfig import ChipConfig
 
@@ -108,6 +116,34 @@ TOOLS = [
         },
     }
 ]
+
+
+def _summarize_compute_demand(prefill_csv: str, decode_csv: str) -> str:
+    """Read Agent 1's compute demand CSVs and produce a concise workload summary for the LLM."""
+    sections = []
+    for phase, csv_path in [("Prefill", prefill_csv), ("Decode", decode_csv)]:
+        df = pd.read_csv(csv_path)
+        total_flops = df["FLOP Count"].sum()
+        compute_ops = df[df["FLOP Count"] > 0]
+        comm_ops = df[df["FLOP Count"] == 0]
+
+        # Top 5 compute-heavy operators with tensor shapes
+        top = df.nlargest(5, "FLOP Count")
+        top_lines = []
+        for _, row in top.iterrows():
+            pct = row["FLOP Count"] / total_flops * 100 if total_flops > 0 else 0
+            top_lines.append(
+                f"  {row['Description']}: {row['FLOP Count']:.2e} FLOPs ({pct:.1f}%), "
+                f"count={row['Count']}, in={row['Input Tensor Shapes']}, out={row['Output Tensor Shapes']}"
+            )
+
+        sections.append(
+            f"### {phase} Phase\n"
+            f"- Total operators: {len(df)} ({len(compute_ops)} compute, {len(comm_ops)} communication/reshape)\n"
+            f"- Total FLOPs: {total_flops:.3e}\n"
+            f"- Top 5 operators by FLOPs:\n" + "\n".join(top_lines)
+        )
+    return "\n\n".join(sections)
 
 
 def _build_system_prompt(
@@ -209,8 +245,8 @@ def _build_iteration_prompt(
     iteration: int,
     results: dict[str, Any],
     history: list[dict[str, Any]],
-    ttft_weight: float = 0.5,
-    tpot_weight: float = 0.5,
+    analysis_report: str = "",
+    **_kwargs: Any,
 ) -> str:
     """Build the prompt for subsequent iterations with simulation feedback."""
     results_str = format_results(results)
@@ -236,35 +272,15 @@ def _build_iteration_prompt(
     if violations:
         violation_str = "\n## CONSTRAINT VIOLATIONS\n" + "\n".join(f"- {v}" for v in violations)
 
-    # Tailor guidance to optimization focus
-    if tpot_weight == 0:
-        focus_guidance = (
-            "Focus on reducing TTFT. This chip is for PREFILL only.\n"
-            "- More/bigger SAs and higher frequency help most.\n"
-            "- TPOT does not matter — ignore it."
-        )
-    elif ttft_weight == 0:
-        focus_guidance = (
-            "Focus on reducing TPOT. This chip is for DECODE only.\n"
-            "- HBM bandwidth is usually the bottleneck — maximize it.\n"
-            "- Adding more SAs may not help if memory-bound.\n"
-            "- TTFT does not matter — ignore it."
-        )
-    else:
-        focus_guidance = (
-            f"Scoring: {ttft_weight:.1f} * (TTFT/baseline) + {tpot_weight:.1f} * (TPOT/baseline). Lower is better.\n"
-            "1. If TPOT is high and decode is memory-bound, adding more SAs won't help much.\n"
-            "2. If TTFT is high and prefill is compute-bound, more/bigger SAs will help."
-        )
-
     return f"""## Iteration {iteration} Results
 
 {results_str}
 {history_summary}{violation_str}
 
-Analyze these results and propose an improved NPU configuration.
+{analysis_report}
 
-{focus_guidance}
+Based on the bottleneck analysis above, propose an improved NPU configuration.
+Apply MULTIPLE parameter changes simultaneously — do NOT change just one parameter.
 - If chip peak power (total_power_peak_W) is over budget, reduce compute units, lower per-unit power, or lower frequency. THIS IS A HARD CONSTRAINT.
 - If power is under budget, you might have room to push harder.
 - If OOM, the config is invalid.
@@ -368,13 +384,14 @@ def _run_seed_phase(
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, float, float | None, float | None]:
     """Run seed configs to explore the design space before the LLM loop.
 
-    Returns (seed_history, best_result, best_score, baseline_ttft, baseline_tpot).
+    Returns (seed_history, best_result, best_score, baseline_ttft, baseline_tpot, best_full_results).
     """
     constrained = {k: upper_bounds[k] for k in ("hbm_bw_GBps", "hbm_size_GB", "ici_bw_GBps", "dcn_bw_GBps")}
 
     seed_history: list[dict[str, Any]] = []
     best_result = None
     best_score = float("inf")
+    best_full_results = None
     baseline_tpot = None
     baseline_ttft = None
 
@@ -443,6 +460,7 @@ def _run_seed_phase(
             if score < best_score:
                 best_score = score
                 best_result = entry
+                best_full_results = results
 
     print(f"  --- Seed phase done: {len(seed_history)} configs evaluated ---")
     if best_result:
@@ -450,7 +468,7 @@ def _run_seed_phase(
         print(f"  Best seed: TTFT={r['TTFT_sec']:.4f}s, TPOT={r['TPOT_ms_request']:.4f}ms, Pwr={r['total_power_peak_W']:.0f}W")
     print()
 
-    return seed_history, best_result, best_score, baseline_ttft, baseline_tpot
+    return seed_history, best_result, best_score, baseline_ttft, baseline_tpot, best_full_results
 
 
 def _format_seed_results(seed_history: list[dict[str, Any]], power_budget_W: float) -> str:
@@ -513,6 +531,8 @@ def run_design_loop(
     ttft_weight: float = 0.5,
     tpot_weight: float = 0.5,
     label: str = "",
+    compute_demand_dir: str | None = None,
+    memory: DesignMemory | None = None,
 ) -> dict[str, Any]:
     """Main design loop: LLM proposes NPU configs, NeuSIM evaluates, iterate.
 
@@ -520,6 +540,7 @@ def run_design_loop(
         ttft_weight: Weight for TTFT in scoring (0.0 = ignore TTFT).
         tpot_weight: Weight for TPOT in scoring (0.0 = ignore TPOT).
         label: Optional label for output directory naming.
+        memory: Cross-workload design memory for experience retrieval/storage.
 
     Returns the best configuration found.
     """
@@ -537,7 +558,31 @@ def run_design_loop(
     run_dir = os.path.join(output_dir, dir_name)
     os.makedirs(run_dir, exist_ok=True)
 
-    # Build system prompt
+    # Build compute demand summary from Agent 1 output
+    compute_demand_summary = ""
+    if compute_demand_dir:
+        prefill_csv = os.path.join(compute_demand_dir, "inference_prefill.csv")
+        decode_csv = os.path.join(compute_demand_dir, "inference_decode.csv")
+        if os.path.exists(prefill_csv) and os.path.exists(decode_csv):
+            compute_demand_summary = _summarize_compute_demand(prefill_csv, decode_csv)
+            print(f"Loaded compute demand from: {compute_demand_dir}")
+        else:
+            print(f"Warning: compute demand CSVs not found in {compute_demand_dir}")
+
+    # Extract workload features for memory retrieval
+    workload_features = extract_workload_features(base_config, tp=tp, pp=pp, bs=bs)
+    optimization_target = "prefill" if tpot_weight == 0 else ("decode" if ttft_weight == 0 else "combined")
+
+    # Retrieve relevant design experiences from memory
+    memory_context = ""
+    if memory and memory.num_episodes() > 0:
+        memory_context = memory.format_for_context(
+            workload_features, optimization_target, top_k=3,
+        )
+        if memory_context:
+            print(f"Retrieved {memory.num_episodes()} design experiences from memory")
+
+    # Build system prompt (instructions only, no workload data)
     system_prompt = _build_system_prompt(
         model_name, base_config, upper_bounds, power_budget_W,
         ttft_weight=ttft_weight, tpot_weight=tpot_weight,
@@ -559,7 +604,7 @@ def run_design_loop(
     print(f"{'='*60}\n")
 
     # ── Seed phase: evaluate diverse configs to map the design space ──────
-    seed_history, best_result, best_score, baseline_ttft, baseline_tpot = _run_seed_phase(
+    seed_history, best_result, best_score, baseline_ttft, baseline_tpot, best_seed_full = _run_seed_phase(
         model_name=model_name, chip_version=chip_version,
         num_chips=num_chips, tp=tp, pp=pp, dp=dp, ep=ep, bs=bs,
         pp_dcn=pp_dcn, dp_dcn=dp_dcn,
@@ -572,27 +617,46 @@ def run_design_loop(
     # ── Build initial conversation with seed knowledge ────────────────────
     seed_results_str = _format_seed_results(seed_history, power_budget_W)
 
+    # Run bottleneck analysis on best seed to give initial design guidance
+    seed_analysis_str = ""
+    if best_seed_full:
+        seed_analysis_str = "\n\n" + run_analysis(
+            best_seed_full, power_budget_W,
+            ttft_weight=ttft_weight, tpot_weight=tpot_weight,
+        )
+
     best_seed_str = ""
     if best_result:
         r = best_result["results"]
         best_seed_str = (
             f"\n\nBest seed so far: TTFT={r['TTFT_sec']:.4f}s, TPOT={r['TPOT_ms_request']:.4f}ms, "
             f"Pwr={r['total_power_peak_W']:.0f}W, Config={json.dumps({k: v for k, v in best_result['chip_overrides'].items() if k in ('num_sa','num_vu','sa_dim','freq_GHz','vmem_size_MB')})}"
-            f"\n\nYour goal: BEAT this result. Try configs the seeds didn't cover — "
-            f"interpolate between seeds, try different combinations, go beyond the grid."
+            f"{seed_analysis_str}"
+            f"\n\nYour goal: BEAT this result. Apply MULTIPLE parameter changes simultaneously based on the bottleneck analysis above."
         )
+
+    # Build first user message: compute demand (Input 1) + seed results
+    user_msg_parts = [
+        f"Design an NPU architecture for {model_name} inference. "
+        f"We will use {num_chips} chips with TP={tp}, PP={pp}, BS={bs}.",
+    ]
+    if compute_demand_summary:
+        user_msg_parts.append(
+            f"\n\n## Workload Computing Demand (from Agent 1)\n"
+            f"Use this to understand the workload characteristics — "
+            f"which operators dominate, their tensor shapes, and compute vs memory patterns.\n\n"
+            f"{compute_demand_summary}"
+        )
+    if memory_context:
+        user_msg_parts.append(f"\n\n{memory_context}")
+    user_msg_parts.append(
+        f"\n\n{seed_results_str}{best_seed_str}\n\n"
+        f"Now propose a config that IMPROVES on the best seed. Call the propose_npu_config tool."
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"Design an NPU architecture for {model_name} inference. "
-                f"We will use {num_chips} chips with TP={tp}, PP={pp}, BS={bs}.\n\n"
-                f"{seed_results_str}{best_seed_str}\n\n"
-                f"Now propose a config that IMPROVES on the best seed. Call the propose_npu_config tool."
-            ),
-        },
+        {"role": "user", "content": "".join(user_msg_parts)},
     ]
 
     # Track seen configs to detect duplicates
@@ -766,10 +830,15 @@ def run_design_loop(
             print(f"\n  Converged after {iteration} iterations!")
             break
 
-        # 10. Feed results back to LLM for next iteration
+        # 10. Run bottleneck analysis and feed results back to LLM
+        analysis_report = run_analysis(
+            results, power_budget_W,
+            ttft_weight=ttft_weight, tpot_weight=tpot_weight,
+        )
         feedback = _build_iteration_prompt(
             iteration, results, history,
             ttft_weight=ttft_weight, tpot_weight=tpot_weight,
+            analysis_report=analysis_report,
         )
         messages.append({
             "role": "tool",
@@ -828,11 +897,38 @@ def run_design_loop(
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
+    # ── Store design experience in memory ──────────────────────────────────
+    if memory and best_result:
+        trajectory_str = _summarize_trajectory(history)
+        reflection = generate_reflection(
+            model_name=model_name,
+            optimization_target=optimization_target,
+            best_config=best_result["chip_overrides"],
+            best_results=best_result["results"],
+            trajectory_summary=trajectory_str,
+            client=client,
+        )
+        print(f"  Design reflection: {reflection}")
+        memory.store_episode(
+            model_name=model_name,
+            optimization_target=optimization_target,
+            workload_features=workload_features,
+            best_config=best_result["chip_overrides"],
+            best_results=best_result["results"],
+            parallelism={"num_chips": num_chips, "tp": tp, "pp": pp, "dp": dp, "ep": ep, "bs": bs},
+            reflection=reflection,
+            power_budget_W=power_budget_W,
+        )
+        # Consolidate semantic principles if enough episodes exist
+        if memory.num_episodes() >= 3:
+            principles = memory.consolidate(client=client)
+            print(f"  Consolidated {len(principles)} design principles")
+
     print(f"\nResults saved to: {run_dir}")
     return summary
 
 
-def run_disaggregated(args, upper_bounds: dict[str, float]) -> None:
+def run_disaggregated(args, upper_bounds: dict[str, float], memory: DesignMemory | None = None) -> None:
     """Run disaggregated serving: optimize prefill chip and decode chip separately."""
     common = dict(
         model_name=args.model,
@@ -852,6 +948,8 @@ def run_disaggregated(args, upper_bounds: dict[str, float]) -> None:
         output_dir=args.output_dir,
         openai_model=args.openai_model,
         upper_bounds=upper_bounds,
+        compute_demand_dir=getattr(args, "compute_demand_dir", None),
+        memory=memory,
     )
 
     print("\n" + "=" * 60)
@@ -955,6 +1053,12 @@ def main():
                         help="Weight for TPOT in scoring (default: 0.5)")
     parser.add_argument("--disaggregated", action="store_true",
                         help="Disaggregated serving: optimize separate prefill and decode chips")
+    parser.add_argument("--compute-demand-dir", type=str, default=None,
+                        help="Path to Agent 1 compute demand output directory (contains inference_prefill.csv and inference_decode.csv)")
+    parser.add_argument("--memory-dir", type=str, default="design_memory",
+                        help="Directory for cross-workload design memory (default: design_memory)")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="Disable cross-workload design memory")
 
     args = parser.parse_args()
 
@@ -965,8 +1069,10 @@ def main():
         "dcn_bw_GBps": args.max_dcn_bw,
     }
 
+    memory = None if args.no_memory else DesignMemory(args.memory_dir)
+
     if args.disaggregated:
-        run_disaggregated(args, upper_bounds)
+        run_disaggregated(args, upper_bounds, memory=memory)
     else:
         run_design_loop(
             model_name=args.model,
@@ -988,6 +1094,8 @@ def main():
             upper_bounds=upper_bounds,
             ttft_weight=args.ttft_weight,
             tpot_weight=args.tpot_weight,
+            compute_demand_dir=args.compute_demand_dir,
+            memory=memory,
         )
 
 
