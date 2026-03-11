@@ -2,7 +2,9 @@
 
 An LLM-driven NPU architecture design system. Given an LLM model structure and hardware constraints, it automatically designs optimal NPU chip configurations by iterating between an LLM architect (GPT-4o) and the [NeuSim](../NeuSim/) performance simulator.
 
-## System Overview
+## Multi-Agent System for NPU Design Overview
+
+<img src="chip_agent/assets/flow.png" width="600">
 
 The system has two agents:
 
@@ -233,8 +235,6 @@ The Agent method consistently:
 ---
 
 ## Agent 1: Compute Demand Extraction
-
-<img src="assets/flow.png" width="600">
 
 ### How It Works
 
