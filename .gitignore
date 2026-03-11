@@ -1,2 +1,5 @@
 /.env
 /__pycache__
+/chip_agent/design_results
+/chip_agent/results
+/NeuSim/results
