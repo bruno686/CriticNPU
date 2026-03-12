@@ -355,6 +355,322 @@ def check_convergence(
     return True
 
 
+# ── Local refinement perturbations ──────────────────────────────────────────
+SA_DIM_VALUES = [64, 128, 256]
+LOCAL_PERTURBATIONS = {
+    "num_sa":       [-2, -1, 1, 2],
+    "num_vu":       [-2, -1, 1, 2],
+    "sa_dim":       [-1, 1],        # index shift in SA_DIM_VALUES
+    "freq_GHz":     [-0.2, -0.15, -0.1, -0.05, 0.05, 0.1, 0.15, 0.2],
+    "vmem_size_MB": [-128, -64, -32, 32, 64, 128],
+}
+LOCAL_PARAM_BOUNDS = {
+    "num_sa": (2, 16), "num_vu": (2, 12),
+    "freq_GHz": (0.5, 2.0), "vmem_size_MB": (32, 512),
+}
+
+
+def _perturb_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Generate a neighbor by perturbing one random parameter."""
+    import random
+    new = dict(config)
+    param = random.choice(list(LOCAL_PERTURBATIONS.keys()))
+    delta = random.choice(LOCAL_PERTURBATIONS[param])
+
+    if param == "sa_dim":
+        cur_idx = SA_DIM_VALUES.index(config["sa_dim"]) if config["sa_dim"] in SA_DIM_VALUES else 1
+        new_idx = max(0, min(2, cur_idx + delta))
+        new["sa_dim"] = SA_DIM_VALUES[new_idx]
+    elif param == "num_vu":
+        lo, hi = LOCAL_PARAM_BOUNDS["num_vu"]
+        new["num_vu"] = max(lo, min(hi, config["num_vu"] + delta))
+        new["num_vu_ports"] = new["num_vu"]
+    else:
+        lo, hi = LOCAL_PARAM_BOUNDS[param]
+        val = config[param] + delta
+        if isinstance(config[param], int):
+            new[param] = int(max(lo, min(hi, val)))
+        else:
+            new[param] = max(lo, min(hi, round(val, 2)))
+    return new
+
+
+def _get_top_k_configs(
+    history: list[dict[str, Any]],
+    power_budget_W: float,
+    baseline_ttft: float,
+    baseline_tpot: float,
+    ttft_weight: float,
+    tpot_weight: float,
+    k: int = 3,
+) -> list[tuple[dict[str, Any], float]]:
+    """Extract top-k unique valid configs from history, sorted by score (ascending)."""
+    scored: list[tuple[dict[str, Any], float, str]] = []
+    for entry in history:
+        if "error" in entry:
+            continue
+        r = entry["results"]
+        if r.get("out_of_memory"):
+            continue
+        if r.get("total_power_peak_W", float("inf")) > power_budget_W:
+            continue
+        score = _compute_score(r, baseline_ttft, baseline_tpot, ttft_weight, tpot_weight)
+        sig = _config_signature(entry["chip_overrides"])
+        scored.append((entry["chip_overrides"], score, sig))
+
+    # Deduplicate by signature, keep best score
+    seen: dict[str, tuple[dict[str, Any], float]] = {}
+    for cfg, sc, sig in scored:
+        if sig not in seen or sc < seen[sig][1]:
+            seen[sig] = (cfg, sc)
+
+    unique = sorted(seen.values(), key=lambda x: x[1])
+    return unique[:k]
+
+
+def _run_local_refinement(
+    best_config: dict[str, Any],
+    best_score: float,
+    best_result: dict[str, Any],
+    *,
+    model_name: str,
+    chip_version: str,
+    base_config: dict[str, Any],
+    num_chips: int,
+    tp: int, pp: int, dp: int, ep: int, bs: int,
+    pp_dcn: int, dp_dcn: int,
+    upper_bounds: dict[str, float],
+    power_budget_W: float,
+    ttft_weight: float,
+    tpot_weight: float,
+    run_dir: str,
+    history: list[dict[str, Any]],
+    seen_configs: set[str],
+    baseline_ttft: float,
+    baseline_tpot: float,
+    max_refine_sims: int = 30,
+) -> tuple[dict[str, Any] | None, float]:
+    """Greedy local search from top-3 configs to push to boundaries."""
+
+    # Extract top-3 starting points from full history
+    top_configs = _get_top_k_configs(
+        history, power_budget_W, baseline_ttft, baseline_tpot,
+        ttft_weight, tpot_weight, k=3,
+    )
+
+    if not top_configs:
+        print("\n  --- Local refinement: no valid configs to refine ---")
+        return best_result, best_score
+
+    n_starts = len(top_configs)
+    trade_reserve = 5  # reserve sims for power-aware trades at the end
+    coord_budget = max_refine_sims - trade_reserve
+    sims_per_start = coord_budget // n_starts
+    print(f"\n  --- Local refinement phase: {n_starts} starts × ~{sims_per_start} sims + {trade_reserve} trade ---")
+    for i, (cfg, sc) in enumerate(top_configs):
+        key_cfg = {k: cfg[k] for k in ("num_sa", "sa_dim", "freq_GHz", "vmem_size_MB") if k in cfg}
+        print(f"  Start-{i}: score={sc:.4f}  {json.dumps(key_cfg)}")
+
+    total_sim_count = 0
+
+    def _try_config(neighbor, start_idx, local_label):
+        """Evaluate a single config, return (score, entry) or None if invalid."""
+        nonlocal total_sim_count, best_result, best_score
+
+        sig = _config_signature(neighbor)
+        if sig in seen_configs:
+            return None
+        seen_configs.add(sig)
+
+        try:
+            power = _fast_power_check(base_config, neighbor, upper_bounds)
+            if power > power_budget_W:
+                return None
+        except Exception:
+            return None
+
+        total_sim_count += 1
+        try:
+            results = run_simulation(
+                model_name=model_name,
+                chip_version=chip_version,
+                chip_overrides=neighbor,
+                num_chips=num_chips,
+                tp=tp, pp=pp, dp=dp, ep=ep, bs=bs,
+                pp_dcn=pp_dcn, dp_dcn=dp_dcn,
+                output_dir=os.path.join(run_dir, f"refine_{total_sim_count:02d}"),
+                upper_bounds=upper_bounds,
+            )
+        except Exception:
+            return None
+
+        is_valid = not results["out_of_memory"] and results["total_power_peak_W"] <= power_budget_W
+        if not is_valid:
+            return None
+
+        score = _compute_score(results, baseline_ttft, baseline_tpot, ttft_weight, tpot_weight)
+
+        entry = {
+            "iteration": f"refine-{local_label}",
+            "chip_overrides": neighbor,
+            "reasoning": f"Coordinate descent from start-{start_idx}",
+            "results": {
+                "TTFT_sec": results["TTFT_sec"],
+                "TPOT_ms_request": results["TPOT_ms_request"],
+                "throughput_tokens_per_sec_request": results["throughput_tokens_per_sec_request"],
+                "avg_power_W_prefill": results["avg_power_W_prefill"],
+                "avg_power_W_decode": results["avg_power_W_decode"],
+                "max_power_W_prefill": results.get("max_power_W_prefill", 0),
+                "max_power_W_decode": results.get("max_power_W_decode", 0),
+                "total_power_peak_W": results["total_power_peak_W"],
+                "mem_footprint_GB_prefill": results["mem_footprint_GB_prefill"],
+                "mem_footprint_GB_decode": results["mem_footprint_GB_decode"],
+                "out_of_memory": results["out_of_memory"],
+            },
+        }
+        history.append(entry)
+
+        key_cfg = {k: neighbor[k] for k in ("num_sa", "sa_dim", "freq_GHz", "vmem_size_MB") if k in neighbor}
+        improved_global = score < best_score
+        print(
+            f"  [{local_label}] {json.dumps(key_cfg)}  →  "
+            f"TTFT={results['TTFT_sec']:.4f}s  TPOT={results['TPOT_ms_request']:.4f}ms  "
+            f"Pwr={results['total_power_peak_W']:.0f}W"
+            f"{'  ★ GLOBAL best!' if improved_global else ''}"
+        )
+
+        if improved_global:
+            best_result = entry
+            best_score = score
+
+        return score, entry
+
+    # Directional coordinate descent: for each param, search up/down efficiently
+    param_steps = {
+        "num_sa":       1,
+        "num_vu":       1,
+        "sa_dim":       1,   # index step in SA_DIM_VALUES
+        "freq_GHz":     0.1,
+        "vmem_size_MB": 64,
+    }
+    sweep_order = ["freq_GHz", "num_sa", "sa_dim", "num_vu", "vmem_size_MB"]
+
+    def _apply_step(cfg, param, direction):
+        """Apply one step in the given direction. Returns new config or None if at bounds."""
+        neighbor = dict(cfg)
+        step = param_steps[param] * direction
+        if param == "sa_dim":
+            cur_idx = SA_DIM_VALUES.index(cfg["sa_dim"]) if cfg["sa_dim"] in SA_DIM_VALUES else 1
+            new_idx = cur_idx + int(step)
+            if new_idx < 0 or new_idx >= len(SA_DIM_VALUES):
+                return None
+            neighbor["sa_dim"] = SA_DIM_VALUES[new_idx]
+        elif param == "num_vu":
+            lo, hi = LOCAL_PARAM_BOUNDS["num_vu"]
+            new_val = cfg["num_vu"] + int(step)
+            if new_val < lo or new_val > hi:
+                return None
+            neighbor["num_vu"] = new_val
+            neighbor["num_vu_ports"] = new_val
+        else:
+            lo, hi = LOCAL_PARAM_BOUNDS[param]
+            new_val = cfg[param] + step
+            if isinstance(cfg[param], int):
+                new_val = int(new_val)
+            else:
+                new_val = round(new_val, 2)
+            if new_val < lo or new_val > hi:
+                return None
+            neighbor[param] = new_val
+        return neighbor
+
+    for start_idx, (start_cfg, start_score) in enumerate(top_configs):
+        if total_sim_count >= coord_budget:
+            break
+
+        current = dict(start_cfg)
+        current_score = start_score
+
+        print(f"\n  -- Coordinate descent from start-{start_idx} --")
+
+        for sweep_round in range(3):
+            improved_any = False
+            for param in sweep_order:
+                if total_sim_count >= coord_budget:
+                    break
+
+                # Try both directions, keep going in the one that improves
+                for direction in [-1, 1]:
+                    probe = _apply_step(current, param, direction)
+                    if probe is None:
+                        continue
+                    label = f"s{start_idx}-{param}={probe.get(param)}"
+                    result = _try_config(probe, start_idx, label)
+                    if result is not None:
+                        score, _ = result
+                        if score < current_score:
+                            print(f"    ↑ {param}: {current.get(param)} → {probe.get(param)}")
+                            current = probe
+                            current_score = score
+                            improved_any = True
+                            # Keep going in this direction
+                            while total_sim_count < coord_budget:
+                                next_probe = _apply_step(current, param, direction)
+                                if next_probe is None:
+                                    break
+                                label2 = f"s{start_idx}-{param}={next_probe.get(param)}"
+                                result2 = _try_config(next_probe, start_idx, label2)
+                                if result2 is not None:
+                                    s2, _ = result2
+                                    if s2 < current_score:
+                                        print(f"    ↑ {param}: {current.get(param)} → {next_probe.get(param)}")
+                                        current = next_probe
+                                        current_score = s2
+                                    else:
+                                        break  # no more improvement in this direction
+                                else:
+                                    break
+                            break  # found improving direction, done with this param
+
+            if not improved_any:
+                break
+
+    # Power-aware trade: try increasing compute (num_sa) by reducing other params (num_vu, freq)
+    if total_sim_count < max_refine_sims:
+        # Find the current overall best from history
+        best_entry = _get_top_k_configs(
+            history, power_budget_W, baseline_ttft, baseline_tpot,
+            ttft_weight, tpot_weight, k=1,
+        )
+        if best_entry:
+            trade_cfg, trade_score = best_entry[0]
+            trade_cfg = dict(trade_cfg)
+            print(f"\n  -- Power-aware trades from best config --")
+            # Try: +1 SA with -1 VU
+            for vu_delta, sa_delta in [(-1, 1), (-2, 1), (-1, 2), (-2, 2)]:
+                if total_sim_count >= max_refine_sims:
+                    break
+                probe = dict(trade_cfg)
+                new_vu = probe.get("num_vu", 4) + vu_delta
+                new_sa = probe.get("num_sa", 4) + sa_delta
+                if new_vu < 2 or new_sa < 2 or new_sa > 16:
+                    continue
+                probe["num_vu"] = new_vu
+                probe["num_vu_ports"] = new_vu
+                probe["num_sa"] = new_sa
+                label = f"trade-sa{new_sa}-vu{new_vu}"
+                result = _try_config(probe, "T", label)
+                if result is not None:
+                    score, _ = result
+                    if score < trade_score:
+                        trade_cfg = probe
+                        trade_score = score
+                        print(f"    ↑ trade improved!")
+
+    print(f"\n  Local refinement total: {total_sim_count} simulations across {n_starts} starts")
+    return best_result, best_score
+
+
 ## ── Seed configs for warm-start ──────────────────────────────────────────
 # Diverse configs to probe the design space before the LLM takes over.
 SEED_CONFIGS = [
@@ -845,6 +1161,29 @@ def run_design_loop(
             "tool_call_id": tool_call.id,
             "content": feedback,
         })
+
+    # ── Local refinement: greedy perturbation around LLM's best config ────
+    if best_result and baseline_ttft and baseline_tpot:
+        best_result, best_score = _run_local_refinement(
+            best_config=best_result["chip_overrides"],
+            best_score=best_score,
+            best_result=best_result,
+            model_name=model_name,
+            chip_version=chip_version,
+            base_config=base_config,
+            num_chips=num_chips,
+            tp=tp, pp=pp, dp=dp, ep=ep, bs=bs,
+            pp_dcn=pp_dcn, dp_dcn=dp_dcn,
+            upper_bounds=upper_bounds,
+            power_budget_W=power_budget_W,
+            ttft_weight=ttft_weight,
+            tpot_weight=tpot_weight,
+            run_dir=run_dir,
+            history=history,
+            seen_configs=seen_configs,
+            baseline_ttft=baseline_ttft,
+            baseline_tpot=baseline_tpot,
+        )
 
     # ── Final summary ──────────────────────────────────────────────────────
     print(f"\n{'='*60}")

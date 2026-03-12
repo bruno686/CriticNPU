@@ -1,6 +1,6 @@
 # Multi-Agent System for NPU Architecture Design
 
-A multi-agent system that automatically designs optimal NPU chip configurations for LLM inference. Three LLM agents collaborate with the [NeuSIM](NeuSim/) performance simulator to explore the hardware design space, achieving **19.6% better TTFT** than grid search while using **17x fewer simulations**.
+A multi-agent system that automatically designs optimal NPU chip configurations for LLM inference. Three LLM agents collaborate with the [NeuSIM](NeuSim/) performance simulator to explore the hardware design space, **matching or beating** Bayesian Optimization, CMA-ES, and Greedy Local Search baselines while using **~50% fewer simulations**.
 
 <img src="chip_agent/assets/flow.png" width="600">
 
@@ -128,7 +128,7 @@ Agent 2 is deliberately constrained: `temperature=0.1`, `max_tokens=80`, and the
 
 **Step 1: Seed warm-start.** Evaluate 9 diverse pre-defined configs spanning the design space (from 2 SA / 0.5 GHz to 16 SA / 1.5 GHz). This maps the landscape and gives Agent 3 a strong starting point. Without seeds, GPT-4o tends to stay near default configs and misses counterintuitive regions (e.g., low frequency being optimal).
 
-**Step 2: LLM iteration loop (max 50 rounds).** Each round:
+**Step 2: LLM iteration loop (max 8 rounds).** Each round:
 1. Agent 3 (GPT-4o) proposes a new config based on all previous results
 2. **Duplicate detection** — if the config was already tried, reject and ask for a new one
 3. **Fast power pre-check** — compute `total_power_peak_W` from the config analytically (~0.001s). If it exceeds the budget, reject instantly without running NeuSIM (~2s). Saves ~30% of iterations.
@@ -138,7 +138,15 @@ Agent 2 is deliberately constrained: `temperature=0.1`, `max_tokens=80`, and the
 
 Convergence: stop if the best score doesn't improve by >2% for 10 consecutive iterations.
 
-**Step 3: Reflect & store.** After the loop completes, GPT-4o generates a design lesson from the trajectory, which is stored in the cross-workload design memory.
+**Step 3: Local refinement (coordinate descent).** After the LLM loop, a deterministic post-hoc refinement corrects the LLM's cognitive biases:
+
+1. Extract **top-3 best valid configs** from the full history (seeds + LLM iterations)
+2. For each starting config, run **directional coordinate descent**: sweep each parameter axis (freq, num_sa, sa_dim, num_vu, vmem) one at a time. For each axis, probe both directions; if one direction improves, keep walking that direction until hitting bounds or no further gain.
+3. **Power-aware trade**: if increasing `num_sa` fails due to power constraint, try simultaneously decreasing `num_vu` to free power headroom.
+
+This step is critical because the LLM has an **anchoring bias on frequency** — it intuitively assumes higher frequency = faster computation and stops at freq=0.8-0.9 GHz. In reality, for prefill (compute-bound under power constraint), lower frequency is optimal because it reduces per-unit power, leaving more thermal budget for additional SAs. The coordinate descent systematically discovers this by walking freq down to the lower bound (0.5 GHz), improving TTFT by ~5%.
+
+**Step 4: Reflect & store.** After the loop completes, GPT-4o generates a design lesson from the trajectory, which is stored in the cross-workload design memory.
 
 ### Disaggregated Serving
 
@@ -203,82 +211,73 @@ Similarity features: `d_ff/TP`, `num_heads/TP`, `num_layers/PP`, `d_head`, `arit
 
 ## Experimental Results
 
-All experiments: power budget = 300W, disaggregated mode (separate prefill & decode chips).
+### Agent vs Optimization Baselines (llama3-8b, tpuv5e, 1 chip, 350W)
 
-### llama3-8b (8 chips, TP=4, PP=2, BS=16)
+All methods use the same constraints, scoring, and power budget. Disaggregated mode: separate prefill and decode chips.
 
-**Agent variants comparison (Prefill TTFT):**
+**Prefill Chip (minimize TTFT):**
 
-| Method | TTFT | vs Grid Search | Simulations |
-|--------|------|----------------|-------------|
-| Grid Search (720 configs) | 0.1859 s | baseline | 1440 |
-| Agent (no Agent 2) | 0.1547 s | -16.8% | ~82 |
-| Agent + Agent 2 v1 (detailed) | 0.1859 s | +0.0% | ~82 |
-| Agent + Agent 2 v2 (concise) | 0.1637 s | -11.9% | ~82 |
-| **Agent + Agent 2 v3 (facts only)** | **0.1495 s** | **-19.6%** | **~82** |
+| Method | TTFT (s) | Sims | Best Config |
+|--------|----------|------|-------------|
+| **Agent** | **0.0705** | **~34** | num_sa=6, sa_dim=256, freq=0.5, num_vu=3 |
+| CMA-ES | 0.0705 | 65 | num_sa=6, sa_dim=256, freq=0.5, num_vu=3 |
+| BO | 0.0713 | 54 | num_sa=6, sa_dim=256, freq=0.56, num_vu=3 |
+| Greedy | 0.0832 | 65 | num_sa=6, sa_dim=256, freq=0.85, num_vu=2 |
 
-**Best results (Agent v3 vs Grid Search):**
+**Decode Chip (minimize TPOT):**
 
-| Metric | Grid Search | Agent (v3) | Improvement |
-|--------|-------------|------------|-------------|
-| Prefill TTFT | 0.1859 s | **0.1495 s** | **-19.6%** |
-| Decode TPOT | 7.2406 ms | **4.5256 ms** | **-37.5%** |
-| Simulations | 1440 | ~82 | **17.6x fewer** |
+| Method | TPOT (ms) | Sims | Best Config |
+|--------|-----------|------|-------------|
+| **Agent** | **8.2549** | **~25** | num_sa=2, sa_dim=64, freq=0.5, num_vu=2 |
+| BO | 8.2549 | 54 | num_sa=5, sa_dim=128, freq=0.5, num_vu=5 |
+| CMA-ES | 8.2549 | 65 | num_sa=4, sa_dim=128, freq=0.5, num_vu=4 |
+| Greedy | 8.2549 | 65 | num_sa=2, sa_dim=64, freq=0.5, num_vu=2 |
 
-**Best prefill chip config:**
+- **Prefill**: Agent ties CMA-ES at the global optimum, beats BO by 1.1% and Greedy by 15.3%, using ~50% fewer simulations.
+- **Decode**: All methods hit the same TPOT (HBM bandwidth is the hard bottleneck — compute resources are irrelevant). Agent finds the most power-efficient config (226W vs BO's 324W).
 
-| Parameter | Grid Search | Agent (v3) |
-|-----------|-------------|------------|
-| num_sa | 8 | **9** |
-| sa_dim | 256 | 256 |
-| freq_GHz | 0.8 | **0.6** |
-| num_vu | 6 | 6 |
-| vmem_size_MB | 128 | **256** |
-| Peak Power | 277 W | **295 W** |
+### Agent Design Ablation (llama3-8b, 8 chips, TP=4, PP=2, BS=16, 300W)
 
-### llama2-13b (8 chips, TP=4, PP=2, BS=1)
+**Effect of Agent 2 feedback granularity on Prefill TTFT:**
 
-| Metric | Grid Search | Agent | Improvement |
-|--------|-------------|-------|-------------|
-| Prefill TTFT | 0.0373 s | **0.0286 s** | **-23.3%** |
-| Decode TPOT | 6.3353 ms | **3.9597 ms** | **-37.5%** |
-| Simulations | 1440 | 55 | **26.2x fewer** |
+| Agent 2 Version | What it outputs | Prefill TTFT |
+|-----------------|-----------------|-------------|
+| v1: Detailed | Multi-paragraph with parameter suggestions | 0.1859 s (+20.2%) |
+| v2: Concise | 2-3 sentences with parameter values | 0.1637 s (+5.8%) |
+| **v3: Facts only** | **One sentence, no recommendations** | **0.1495 s (-3.4%)** |
+| No Agent 2 | No bottleneck analysis | 0.1547 s (baseline) |
 
-### llama3-70b (16 chips, TP=8, PP=2, BS=16)
+**Key finding:** More analysis **hurts** performance. Detailed recommendations anchor Agent 3's exploration space. One-sentence factual feedback lets Agent 3 make its own design decisions.
 
-| Metric | Agent (v3) |
-|--------|------------|
-| Prefill TTFT | 0.6086 s |
-| Decode TPOT | 17.3315 ms |
-| Best prefill config | num_sa=9, sa_dim=256, freq=0.59 GHz, vmem=420 MB, Power=293 W |
+### Cross-Workload Transfer
 
-**Cross-workload finding:** llama3-8b (TP=4) and llama3-70b (TP=8) converge to nearly identical configs because their per-chip workloads are the same after sharding. This validates the per-chip similarity metric used in the design memory.
+llama3-8b (TP=4) and llama3-70b (TP=8) converge to nearly identical optimal configs because their per-chip workloads are the same after sharding:
+- llama3-8b TP=4: per-chip d_ff = 14336/4 = **3584**, heads = 32/4 = **8**
+- llama3-70b TP=8: per-chip d_ff = 28672/8 = **3584**, heads = 64/8 = **8**
+
+This validates the per-chip workload similarity metric used in the design memory.
 
 ### Key Findings
 
-1. **Better configs** — the agent explores continuous parameter values outside the grid (e.g., num_sa=9, freq=0.54 GHz) that grid search cannot reach
-2. **17-26x fewer simulations** — seed warm-start + LLM-guided search + power pre-check avoids wasted evaluations
-3. **Full power budget utilization** — Agent configs land at ~295-299 W (just under 300 W budget), while grid search peaks at 277 W
-4. **Facts-only bottleneck analysis is optimal** — detailed recommendations from Agent 2 constrain Agent 3's exploration; one-sentence facts let Agent 3 make its own decisions
-
-> **Note:** Decode TPOT improvements below freq=0.8 GHz are partly influenced by a NeuSIM tile-shape selection artifact where execution time scales linearly with frequency for memory-bound operations.
+1. **Matches or beats classical optimization** — Agent ties CMA-ES/BO at the optimum with ~50% fewer simulations, thanks to LLM's architectural reasoning for fast region identification + coordinate descent for boundary pushing
+2. **LLM anchoring bias is real and correctable** — the LLM consistently stops at freq=0.8-0.9 GHz because "higher frequency = faster" is common sense. The actual optimum is freq=0.5 GHz. Coordinate descent corrects this bias systematically.
+3. **Facts-only bottleneck analysis is optimal** — detailed Agent 2 recommendations constrain Agent 3's exploration; one-sentence facts let Agent 3 decide
+4. **Decode is pure HBM-bound** — all methods converge to the same TPOT regardless of compute resources. The optimal decode chip is minimal compute + minimal frequency.
 
 ---
 
-## Baseline: Grid Search
+## Baselines
 
-`baseline_grid.py` provides a brute-force baseline:
+Four baselines in `chip_agent/`:
 
-```
-Search grid (720 combinations):
-  num_sa:       [4, 6, 8, 10, 12]
-  num_vu:       [4, 6, 8, 10]
-  sa_dim:       [64, 128, 256]
-  freq_GHz:     [0.8, 1.0, 1.2, 1.4]
-  vmem_size_MB: [128, 256, 384]
-```
+| Baseline | File | Method |
+|----------|------|--------|
+| **Grid Search** | `baseline_grid.py` | Exhaustive 720-point grid |
+| **Bayesian Optimization** | `baseline_bo.py` | GP surrogate + Expected Improvement (15 init + 50 BO iterations) |
+| **CMA-ES** | `baseline_es.py` | Covariance Matrix Adaptation Evolution Strategy (pop=10, budget=65) |
+| **Greedy Local Search** | `baseline_greedy.py` | Single-parameter perturbation from seed configs + random restart |
 
-Same constraints, same scoring, same power budget.
+All baselines use the same design space, constraints, power budget, and scoring as the Agent.
 
 ---
 
