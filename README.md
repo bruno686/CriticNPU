@@ -7,10 +7,10 @@ A multi-agent system that automatically designs optimal NPU chip configurations 
 ---
 
 ## Week Progress
-2026/3/12: Build out the full 3-agent framework (compute demand extraction, bottleneck analysis, NPU design) with seed warm-start, directional coordinate descent refinement, and cross-workload design memory (episodic memory for per-run reflections, semantic memory for consolidated design principles, retrieval via per-chip workload similarity). Implement and fix four baselines (Grid, BO, CMA-ES, Greedy). Run experiments on llama3-8b/tpuv5e for both prefill and decode chips — agent matches or beats all baselines with ~50% fewer simulations. \
-Next steps: We will evaluate the framework through large-scale experiments and further refine the details to ensure the method is effective and easy to reproduce.
+**2026/3/12**: Build out the full 3-agent framework (compute demand extraction, bottleneck analysis, NPU design) with seed warm-start, directional coordinate descent refinement, and cross-workload design memory (episodic memory for per-run reflections, semantic memory for consolidated design principles, retrieval via per-chip workload similarity). Implement and fix four baselines (Grid, BO, CMA-ES, Greedy). Run experiments on llama3-8b/tpuv5e for both prefill and decode chips — agent matches or beats all baselines with ~50% fewer simulations. \
+**Next steps**: We will evaluate the framework through large-scale experiments and further refine the details to ensure the method is effective and easy to reproduce.
 
-2026/3/4: Clarify the problem definition, determine what the overall workflow/framework should look like, and decide how to define the evaluation metrics.
+**2026/3/4**: Clarify the problem definition, determine what the overall workflow/framework should look like, and decide how to define the evaluation metrics.
 
 
 
