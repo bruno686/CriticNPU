@@ -1,0 +1,219 @@
+[
+  {
+    "model_name": "llama3-8b",
+    "optimization_target": "prefill",
+    "workload_features": {
+      "per_chip_d_ff": 3584.0,
+      "per_chip_heads": 8.0,
+      "per_chip_kv_heads": 2.0,
+      "per_chip_layers": 16.0,
+      "d_head": 128,
+      "input_seqlen": 4096,
+      "output_seqlen": 512,
+      "batch_size": 16,
+      "arithmetic_intensity": 37287.724137931036,
+      "total_flops_estimate": 72567767433216.0,
+      "total_bytes_estimate": 1946157056.0,
+      "is_moe": 0.0
+    },
+    "best_config": {
+      "num_sa": 9,
+      "num_vu": 6,
+      "num_vu_ports": 6,
+      "sa_dim": 256,
+      "freq_GHz": 0.5,
+      "vmem_size_MB": 512,
+      "hbm_bw_GBps": 600,
+      "ici_bw_GBps": 125
+    },
+    "best_results": {
+      "TTFT_sec": 0.1350712,
+      "TPOT_ms_request": 4.525552,
+      "total_power_peak_W": 295.42278131675005
+    },
+    "parallelism": {
+      "num_chips": 8,
+      "tp": 4,
+      "pp": 2,
+      "dp": 1,
+      "ep": 1,
+      "bs": 16
+    },
+    "power_budget_W": 300.0,
+    "reflection": "For this compute-bound prefill workload, the optimal configuration was achieved by maximizing the number of SAs while operating at a low frequency to manage power consumption effectively. The counterintuitive finding was that a lower frequency allowed for more SAs, which improved throughput and reduced TTFT more significantly than higher frequencies. The key trade-off was balancing the number of SAs and frequency to optimize performance within the power budget, with additional SAs providing greater benefits than increased clock speed."
+  },
+  {
+    "model_name": "llama3-8b",
+    "optimization_target": "decode",
+    "workload_features": {
+      "per_chip_d_ff": 3584.0,
+      "per_chip_heads": 8.0,
+      "per_chip_kv_heads": 2.0,
+      "per_chip_layers": 16.0,
+      "d_head": 128,
+      "input_seqlen": 4096,
+      "output_seqlen": 512,
+      "batch_size": 16,
+      "arithmetic_intensity": 37287.724137931036,
+      "total_flops_estimate": 72567767433216.0,
+      "total_bytes_estimate": 1946157056.0,
+      "is_moe": 0.0
+    },
+    "best_config": {
+      "num_sa": 2,
+      "num_vu": 2,
+      "num_vu_ports": 2,
+      "sa_dim": 64,
+      "freq_GHz": 0.5,
+      "vmem_size_MB": 128,
+      "hbm_bw_GBps": 600.0,
+      "hbm_size_GB": 16,
+      "ici_bw_GBps": 125.0,
+      "dcn_bw_GBps": 12.5
+    },
+    "best_results": {
+      "TTFT_sec": 5.263197472,
+      "TPOT_ms_request": 4.525552,
+      "total_power_peak_W": 160.37910931674998
+    },
+    "parallelism": {
+      "num_chips": 8,
+      "tp": 4,
+      "pp": 2,
+      "dp": 1,
+      "ep": 1,
+      "bs": 16
+    },
+    "power_budget_W": 300.0,
+    "reflection": "For this memory-bound decode workload, the optimal configuration was driven by maximizing HBM bandwidth while maintaining a low frequency to manage power consumption. Counterintuitively, a lower frequency was beneficial as it allowed the system to stay within power limits, enabling the use of more memory resources without exceeding the power budget. The key trade-off was between frequency and memory bandwidth, where prioritizing bandwidth led to better performance metrics than increasing compute resources or frequency."
+  },
+  {
+    "model_name": "llama3-8b",
+    "optimization_target": "prefill",
+    "workload_features": {
+      "per_chip_d_ff": 3584.0,
+      "per_chip_heads": 8.0,
+      "per_chip_kv_heads": 2.0,
+      "per_chip_layers": 16.0,
+      "d_head": 128,
+      "input_seqlen": 4096,
+      "output_seqlen": 512,
+      "batch_size": 16,
+      "arithmetic_intensity": 37287.724137931036,
+      "total_flops_estimate": 72567767433216.0,
+      "total_bytes_estimate": 1946157056.0,
+      "is_moe": 0.0
+    },
+    "best_config": {
+      "num_sa": 9,
+      "num_vu": 6,
+      "num_vu_ports": 6,
+      "sa_dim": 256,
+      "freq_GHz": 0.5,
+      "vmem_size_MB": 512,
+      "ici_bw_GBps": 125
+    },
+    "best_results": {
+      "TTFT_sec": 0.1350712,
+      "TPOT_ms_request": 4.525552,
+      "total_power_peak_W": 295.42278131675005
+    },
+    "parallelism": {
+      "num_chips": 8,
+      "tp": 4,
+      "pp": 2,
+      "dp": 1,
+      "ep": 1,
+      "bs": 16
+    },
+    "power_budget_W": 300.0,
+    "reflection": "For this compute-bound prefill workload, the optimal configuration was driven by maximizing the number of SAs while operating at a lower frequency to stay within the power budget. The counterintuitive finding was that reducing the frequency allowed for more SAs, which significantly improved TTFT more than higher frequencies would have. The key trade-off was between frequency and SA count, where the power savings from operating at a lower frequency enabled the addition of more SAs, enhancing performance without exceeding power constraints."
+  },
+  {
+    "model_name": "llama3-8b",
+    "optimization_target": "prefill",
+    "workload_features": {
+      "per_chip_d_ff": 3584.0,
+      "per_chip_heads": 8.0,
+      "per_chip_kv_heads": 2.0,
+      "per_chip_layers": 16.0,
+      "d_head": 128,
+      "input_seqlen": 4096,
+      "output_seqlen": 512,
+      "batch_size": 16,
+      "arithmetic_intensity": 37287.724137931036,
+      "total_flops_estimate": 72567767433216.0,
+      "total_bytes_estimate": 1946157056.0,
+      "is_moe": 0.0
+    },
+    "best_config": {
+      "num_sa": 9,
+      "num_vu": 8,
+      "num_vu_ports": 8,
+      "sa_dim": 256,
+      "freq_GHz": 0.5,
+      "vmem_size_MB": 512,
+      "ici_bw_GBps": 125.0
+    },
+    "best_results": {
+      "TTFT_sec": 0.1350712,
+      "TPOT_ms_request": 4.525552,
+      "total_power_peak_W": 299.45993731675003
+    },
+    "parallelism": {
+      "num_chips": 8,
+      "tp": 4,
+      "pp": 2,
+      "dp": 1,
+      "ep": 1,
+      "bs": 16
+    },
+    "power_budget_W": 300.0,
+    "reflection": "For this compute-bound prefill workload, the optimal configuration was achieved by maximizing the number of SAs while operating at a lower frequency to manage power consumption effectively. The counterintuitive finding was that reducing the frequency allowed for more SAs to be added within the power budget, which significantly improved TTFT more than increasing the frequency would have. The key trade-off was between the number of SAs and operating frequency, where the power savings from a lower frequency enabled a higher SA count, enhancing performance."
+  },
+  {
+    "model_name": "llama3-8b",
+    "optimization_target": "decode",
+    "workload_features": {
+      "per_chip_d_ff": 3584.0,
+      "per_chip_heads": 8.0,
+      "per_chip_kv_heads": 2.0,
+      "per_chip_layers": 16.0,
+      "d_head": 128,
+      "input_seqlen": 4096,
+      "output_seqlen": 512,
+      "batch_size": 16,
+      "arithmetic_intensity": 37287.724137931036,
+      "total_flops_estimate": 72567767433216.0,
+      "total_bytes_estimate": 1946157056.0,
+      "is_moe": 0.0
+    },
+    "best_config": {
+      "num_sa": 2,
+      "num_vu": 2,
+      "num_vu_ports": 2,
+      "sa_dim": 64,
+      "freq_GHz": 0.5,
+      "vmem_size_MB": 128,
+      "hbm_bw_GBps": 600.0,
+      "hbm_size_GB": 16,
+      "ici_bw_GBps": 125.0,
+      "dcn_bw_GBps": 12.5
+    },
+    "best_results": {
+      "TTFT_sec": 5.263197472,
+      "TPOT_ms_request": 4.525552,
+      "total_power_peak_W": 160.37910931674998
+    },
+    "parallelism": {
+      "num_chips": 8,
+      "tp": 4,
+      "pp": 2,
+      "dp": 1,
+      "ep": 1,
+      "bs": 16
+    },
+    "power_budget_W": 300.0,
+    "reflection": "For this memory-bound decode workload, the optimal configuration was achieved by minimizing frequency and compute resources to reduce power consumption, allowing for increased memory bandwidth and size. Counterintuitively, a lower frequency with fewer SAs provided better power efficiency, enabling the system to handle memory demands effectively without exceeding power limits. The key trade-off was balancing compute resources with memory bandwidth to optimize throughput and power usage."
+  }
+]

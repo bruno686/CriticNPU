@@ -1,8 +1,9 @@
-"""NPU Design Agent (Agent 2): iteratively designs NPU architecture using LLM + NeuSIM.
+"""NPU Design Agent (Agent B / Design Planner): designs NPU architecture using
+a roofline-based world model + LLM reasoning + NeuSIM validation.
 
 Given an LLM model and upper-bound constraints (hbm_bw, hbm_size, ici_bw, dcn_bw),
-this agent uses an LLM to propose NPU architecture parameters, runs NeuSIM to
-evaluate them, and iterates until convergence.
+this agent uses a physics-based world model (roofline) to guide LLM design decisions,
+runs NeuSIM for validation, and iterates until convergence.
 
 Supports disaggregated serving: separately optimize a prefill chip and a decode chip.
 """
@@ -27,6 +28,7 @@ from neusim_runner import (
     run_simulation,
 )
 from bottleneck_analysis import run_analysis
+from world_model import LearnedRoofline
 from design_memory import (
     DesignMemory,
     extract_workload_features,
@@ -34,6 +36,15 @@ from design_memory import (
     _summarize_trajectory,
 )
 from neusim.configs.chips.ChipConfig import ChipConfig
+from world_model import (
+    RooflineModel,
+    build_roofline,
+    populate_from_ops,
+    predict_cascade,
+    predict_power,
+    suggest_directions,
+    format_for_llm,
+)
 
 # ── Tunable NPU parameters and their descriptions ──────────────────────────
 TUNABLE_PARAMS = {
@@ -229,6 +240,23 @@ To estimate peak power BEFORE simulation: total ≈ fixed_base + (static_power_W
 - Larger VMEM → better data reuse, less HBM traffic
 - CRITICAL: do NOT assume baseline defaults are good. Sometimes going BELOW defaults gives better results.
 
+## Roofline World Model
+You will receive a roofline analysis after each simulation that shows:
+- **Compute ceiling** = num_sa × sa_dim² × 2 × freq_GHz (GFLOPS): max compute throughput
+- **BW ceiling** = hbm_bw_GBps (GB/s): max memory bandwidth
+- **Ridge point** = compute_ceiling / BW_ceiling (FLOP/byte): the crossover point
+- Operators with arithmetic_intensity > ridge_point are **compute-bound** (limited by SAs)
+- Operators with arithmetic_intensity < ridge_point are **memory-bound** (limited by HBM BW)
+
+Use the roofline to reason about your design:
+- If most time is in compute-bound ops → increase compute ceiling (more SAs, larger sa_dim, higher freq)
+- If most time is in memory-bound ops → increase BW or reduce HBM traffic (larger VMEM); reducing compute saves power without hurting perf
+- Watch **ridge crossings**: increasing compute may push ridge RIGHT, making some ops memory-bound
+- The roofline predicts **cascade effects**: fixing one bottleneck reveals the next
+
+When "Roofline-Suggested Directions" are provided, they include physics-based speedup estimates.
+Use these as informed starting points, but you may deviate based on your own reasoning.
+
 ## IMPORTANT: Avoid Duplicate Configs
 Do NOT propose a config you (or the seeds) already tried. Every iteration must explore a NEW configuration.
 If you keep getting similar results, try a DRAMATICALLY different approach.
@@ -315,13 +343,9 @@ def _fast_power_check(
 ) -> float:
     """Compute total_power_peak_W without running a full simulation.
 
-    Builds a ChipConfig from the merged config and reads the power property.
-    This is ~1000x faster than running a full NeuSIM simulation.
+    Delegates to the world model's predict_power for consistency.
     """
-    merged = dict(base_config)
-    merged = apply_chip_overrides(merged, overrides, upper_bounds=upper_bounds)
-    chip_cfg = ChipConfig.model_validate(merged)
-    return chip_cfg.total_power_peak_W
+    return predict_power(base_config, overrides, upper_bounds)
 
 
 def check_convergence(
@@ -449,6 +473,7 @@ def _run_local_refinement(
     baseline_ttft: float,
     baseline_tpot: float,
     max_refine_sims: int = 30,
+    learned_roofline: LearnedRoofline | None = None,
 ) -> tuple[dict[str, Any] | None, float]:
     """Greedy local search from top-3 configs to push to boundaries."""
 
@@ -489,6 +514,18 @@ def _run_local_refinement(
         except Exception:
             return None
 
+        # Surrogate gating: predict with world model, skip if confident it's worse
+        if learned_roofline is not None and learned_roofline.confidence_score() >= 0.3:
+            pred = learned_roofline.surrogate_predict(neighbor, base_config, upper_bounds)
+            if pred is not None:
+                # Predict the score using the target metric
+                pred_score = _compute_score(
+                    {"TTFT_sec": pred["predicted_TTFT_sec"], "TPOT_ms_request": pred["predicted_TPOT_ms"]},
+                    baseline_ttft, baseline_tpot, ttft_weight, tpot_weight,
+                )
+                if not learned_roofline.should_simulate(pred_score, best_score, minimize=True):
+                    return None  # surrogate says not worth simulating
+
         total_sim_count += 1
         try:
             results = run_simulation(
@@ -509,6 +546,15 @@ def _run_local_refinement(
             return None
 
         score = _compute_score(results, baseline_ttft, baseline_tpot, ttft_weight, tpot_weight)
+
+        # Track surrogate prediction accuracy for confidence calibration
+        if learned_roofline is not None:
+            pred = learned_roofline.surrogate_predict(neighbor, base_config, upper_bounds)
+            if pred is not None:
+                if ttft_weight > 0:
+                    learned_roofline.record_prediction_error(pred["predicted_TTFT_sec"], results["TTFT_sec"])
+                if tpot_weight > 0:
+                    learned_roofline.record_prediction_error(pred["predicted_TPOT_ms"], results["TPOT_ms_request"])
 
         entry = {
             "iteration": f"refine-{local_label}",
@@ -557,6 +603,8 @@ def _run_local_refinement(
 
     def _apply_step(cfg, param, direction):
         """Apply one step in the given direction. Returns new config or None if at bounds."""
+        if param not in cfg:
+            return None
         neighbor = dict(cfg)
         step = param_steps[param] * direction
         if param == "sa_dim":
@@ -919,6 +967,9 @@ def run_design_loop(
     print(f"Power budget: {power_budget_W}W")
     print(f"{'='*60}\n")
 
+    # ── Create online-learned roofline model ─────────────────────────────
+    learned_roofline = LearnedRoofline(ema_alpha=0.3)
+
     # ── Seed phase: evaluate diverse configs to map the design space ──────
     seed_history, best_result, best_score, baseline_ttft, baseline_tpot, best_seed_full = _run_seed_phase(
         model_name=model_name, chip_version=chip_version,
@@ -935,11 +986,15 @@ def run_design_loop(
 
     # Run bottleneck analysis on best seed to give initial design guidance
     seed_analysis_str = ""
+    roofline_model = None
     if best_seed_full:
-        seed_analysis_str = "\n\n" + run_analysis(
+        analysis_str, roofline_model = run_analysis(
             best_seed_full, power_budget_W,
             ttft_weight=ttft_weight, tpot_weight=tpot_weight,
+            base_config=base_config, upper_bounds=upper_bounds,
+            learned=learned_roofline,
         )
+        seed_analysis_str = "\n\n" + analysis_str
 
     best_seed_str = ""
     if best_result:
@@ -1051,6 +1106,39 @@ def run_design_loop(
             })
             continue
 
+        # 3d. Surrogate gating — predict with learned world model, skip if confident it's worse
+        if learned_roofline.confidence_score() >= 0.3:
+            pred = learned_roofline.surrogate_predict(chip_overrides, base_config, upper_bounds)
+            if pred is not None:
+                # Which metric to check depends on optimization focus
+                skip = False
+                if ttft_weight > 0 and tpot_weight == 0 and best_result:
+                    best_ttft = best_result["results"]["TTFT_sec"]
+                    skip = not learned_roofline.should_simulate(pred["predicted_TTFT_sec"], best_ttft)
+                elif tpot_weight > 0 and ttft_weight == 0 and best_result:
+                    best_tpot = best_result["results"]["TPOT_ms_request"]
+                    skip = not learned_roofline.should_simulate(pred["predicted_TPOT_ms"], best_tpot)
+                elif best_result:
+                    pred_score = _compute_score(
+                        {"TTFT_sec": pred["predicted_TTFT_sec"], "TPOT_ms_request": pred["predicted_TPOT_ms"]},
+                        baseline_ttft, baseline_tpot, ttft_weight, tpot_weight,
+                    )
+                    skip = not learned_roofline.should_simulate(pred_score, best_score)
+
+                if skip:
+                    metric_str = f"TTFT={pred['predicted_TTFT_sec']:.4f}s" if ttft_weight > 0 else f"TPOT={pred['predicted_TPOT_ms']:.4f}ms"
+                    print(f"  ** SURROGATE SKIP: predicted {metric_str} worse than best (conf={pred['confidence']:.0%})")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": (
+                            f"SURROGATE PREDICTION: The world model predicts this config will achieve "
+                            f"TTFT={pred['predicted_TTFT_sec']:.4f}s, TPOT={pred['predicted_TPOT_ms']:.4f}ms — "
+                            f"worse than the current best. Try a MORE aggressive change."
+                        ),
+                    })
+                    continue
+
         # 4. Run NeuSIM simulation
         iter_output_dir = os.path.join(run_dir, f"iter_{iteration:02d}")
         try:
@@ -1088,6 +1176,15 @@ def run_design_loop(
 
         # 5. Print results
         print(format_results(results))
+
+        # 5b. Update surrogate reference and track prediction accuracy
+        learned_roofline.store_reference(results["TTFT_sec"], results["TPOT_ms_request"])
+        pred = learned_roofline.surrogate_predict(chip_overrides, base_config, upper_bounds)
+        if pred is not None:
+            if ttft_weight > 0:
+                learned_roofline.record_prediction_error(pred["predicted_TTFT_sec"], results["TTFT_sec"])
+            if tpot_weight > 0:
+                learned_roofline.record_prediction_error(pred["predicted_TPOT_ms"], results["TPOT_ms_request"])
 
         # 6. Record history
         entry = {
@@ -1146,10 +1243,14 @@ def run_design_loop(
             print(f"\n  Converged after {iteration} iterations!")
             break
 
-        # 10. Run bottleneck analysis and feed results back to LLM
-        analysis_report = run_analysis(
+        # 10. Build/update roofline world model and feed results back to LLM
+        #     The learned_roofline is updated in-place by run_analysis,
+        #     making each iteration's predictions more accurate.
+        analysis_report, roofline_model = run_analysis(
             results, power_budget_W,
             ttft_weight=ttft_weight, tpot_weight=tpot_weight,
+            base_config=base_config, upper_bounds=upper_bounds,
+            learned=learned_roofline,
         )
         feedback = _build_iteration_prompt(
             iteration, results, history,
@@ -1183,6 +1284,7 @@ def run_design_loop(
             seen_configs=seen_configs,
             baseline_ttft=baseline_ttft,
             baseline_tpot=baseline_tpot,
+            learned_roofline=learned_roofline,
         )
 
     # ── Final summary ──────────────────────────────────────────────────────

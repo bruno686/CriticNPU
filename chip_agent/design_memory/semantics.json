@@ -1,0 +1,4 @@
+[
+  "\"For compute-bound workloads, prioritize increasing the number of SAs over frequency to enhance throughput while managing power consumption effectively.\"",
+  "\"For memory-bound workloads, prioritize maximizing memory bandwidth over increasing compute resources or frequency to optimize performance within power constraints.\""
+]
