@@ -1,39 +1,9 @@
-/.env
-/__pycache__
-/chip_agent/design_results
-/chip_agent/results
-/NeuSim/results
-/design_results
-/chip_agent/design_results_all
-/chip_agent/design_results_wm
-/R-Zero
-/npu_rl
-.claude
-/review_last_time_full
-chip_agent/figures
-chip_agent/__pycache__
-physicsagent_paper
-solver_reward.png 
-solver_reward_1.png 
-roofline_method.md 
-roofline_method_condensed.md 
-roofline_intro.md 
-roofline_experiments.md 
-proposer_v1.log 
-proposer_reward.png 
-METHODS.md 
-INTRODUCTION.md 
+# Ignore everything at outer-repo root except README.md.
+# Subdirectories (chip_agent/, NeuSim/) keep their own tracked contents.
+/*
 
-
-chip_agent/__pycache__
-chip_agent/plot_ablation.py 
-chip_agent/plot_convergence.py 
-chip_agent/plot_iterations.py 
-chip_agent/plot_roofline_viz.py 
-chip_agent/plot_surrogate_accuracy.py 
-chip_agent/summarize_results.py
-chip_agent/ablation_planners.py
-chip_agent/main.png
-
-
-CLAUDE.md
+# Whitelist
+!/.gitignore
+!/README.md
+!/chip_agent
+!/NeuSim
