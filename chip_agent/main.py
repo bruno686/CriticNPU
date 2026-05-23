@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--convergence-threshold", type=float, default=0.02)
     parser.add_argument("--convergence-window", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="design_results")
-    parser.add_argument("--openai-model", type=str, default="gpt-4o")
+    parser.add_argument("--openai-model", type=str, default="gpt-5.4-mini")
     parser.add_argument("--max-hbm-bw", type=float, default=600.0)
     parser.add_argument("--max-hbm-size", type=float, default=16)
     parser.add_argument("--max-ici-bw", type=float, default=125.0)

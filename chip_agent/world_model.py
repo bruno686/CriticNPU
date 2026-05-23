@@ -289,9 +289,10 @@ class LearnedRoofline:
         if conf < 0.3:
             return True
 
+        import os
+        _margin_base = float(os.environ.get("NPUAGENT_GATING_MARGIN", "0.05"))
+        margin = _margin_base * (1 - conf)  # tighter margin at higher confidence
         if minimize:
-            # If surrogate predicts worse than best by a margin, skip
-            margin = 0.05 * (1 - conf)  # tighter margin at higher confidence
             if predicted_metric > best_metric * (1 + margin):
                 return False
         else:

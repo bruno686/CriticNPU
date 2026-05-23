@@ -232,10 +232,10 @@ The HBM and ICI power components are fixed (set by bandwidth). You control SA/VU
 To estimate peak power BEFORE simulation: total ≈ fixed_base + (static_power_W_per_sa + dynamic_power_W_per_SA) * num_sa + (static_power_W_per_vu + dynamic_power_W_per_VU) * num_vu + static_power_vmem_W + dynamic_power_vmem_W
 
 ## Key Trade-offs
-- More SAs → faster matrix ops but higher power. USELESS if memory-bound (decode)
+- More SAs → faster matrix ops but higher power. Whether extra SAs help depends on the arithmetic intensity of the dominant ops — check the roofline.
 - Higher freq → faster clock but power scales quadratically. LOWER freq can be BETTER if it avoids power-limit bottleneck
-- Larger SA dim → better for large matmuls (prefill), but WORSE for small decode matmuls (padding overhead)
-- For DECODE: HBM bandwidth is almost always the bottleneck. More compute won't help. Minimize compute to save power.
+- Larger SA dim processes bigger matrix blocks per cycle; whether it helps depends on the matmul shapes in the workload (check the top-operator shapes from the compute-demand summary, not the "prefill vs decode" label alone).
+- For DECODE: HBM bandwidth is often the bottleneck, BUT this only holds if compute can keep up. Under-provisioning compute leaves HBM idle and TPOT suffers. A common mistake is choosing too few SAs (e.g., num_sa=2-6) thinking "decode is memory-bound so save compute" — in practice you usually need num_sa in the 8-12 range for decode to actually saturate HBM, especially on MoE workloads where per-step expert matmuls are substantial. Start with num_sa=8-12 and only reduce if the roofline explicitly shows spare compute.
 - For PREFILL: compute is the bottleneck. More/bigger SAs help most.
 - Larger VMEM → better data reuse, less HBM traffic
 - CRITICAL: do NOT assume baseline defaults are good. Sometimes going BELOW defaults gives better results.
@@ -472,7 +472,7 @@ def _run_local_refinement(
     seen_configs: set[str],
     baseline_ttft: float,
     baseline_tpot: float,
-    max_refine_sims: int = 30,
+    max_refine_sims: int = 40,
     learned_roofline: LearnedRoofline | None = None,
 ) -> tuple[dict[str, Any] | None, float]:
     """Greedy local search from top-3 configs to push to boundaries."""
@@ -488,7 +488,7 @@ def _run_local_refinement(
         return best_result, best_score
 
     n_starts = len(top_configs)
-    trade_reserve = 5  # reserve sims for power-aware trades at the end
+    trade_reserve = 18  # reserve sims for power-aware trades at the end
     coord_budget = max_refine_sims - trade_reserve
     sims_per_start = coord_budget // n_starts
     print(f"\n  --- Local refinement phase: {n_starts} starts × ~{sims_per_start} sims + {trade_reserve} trade ---")
@@ -498,7 +498,7 @@ def _run_local_refinement(
 
     total_sim_count = 0
 
-    def _try_config(neighbor, start_idx, local_label):
+    def _try_config(neighbor, start_idx, local_label, bypass_surrogate=False):
         """Evaluate a single config, return (score, entry) or None if invalid."""
         nonlocal total_sim_count, best_result, best_score
 
@@ -515,7 +515,7 @@ def _run_local_refinement(
             return None
 
         # Surrogate gating: predict with world model, skip if confident it's worse
-        if learned_roofline is not None and learned_roofline.confidence_score() >= 0.3:
+        if not bypass_surrogate and learned_roofline is not None and learned_roofline.confidence_score() >= 0.3:
             pred = learned_roofline.surrogate_predict(neighbor, base_config, upper_bounds)
             if pred is not None:
                 # Predict the score using the target metric
@@ -715,6 +715,68 @@ def _run_local_refinement(
                         trade_score = score
                         print(f"    ↑ trade improved!")
 
+            # Joint (num_sa, freq) moves: needed when the power-feasible path
+            # to a better config requires simultaneously adding compute and
+            # lowering frequency (e.g., HBM-saturating configs in constrained
+            # power budgets). Single-parameter coord descent cannot traverse
+            # this diagonal because intermediate states either exceed power
+            # or do not improve the objective.
+            for sa_delta, freq_delta in [
+                (1, -0.1), (1, -0.2), (1, -0.4),
+                (2, -0.2), (2, -0.3), (2, -0.5),
+                (3, -0.3), (3, -0.5), (3, -0.7),
+                (4, -0.4), (4, -0.6), (4, -0.8),
+                (6, -0.5), (6, -0.7), (6, -1.0),
+                (-1, 0.1), (-1, 0.2),
+            ]:
+                if total_sim_count >= max_refine_sims:
+                    break
+                probe = dict(trade_cfg)
+                new_sa = probe.get("num_sa", 4) + sa_delta
+                new_freq = round(probe.get("freq_GHz", 1.0) + freq_delta, 2)
+                if new_sa < 2 or new_sa > 16:
+                    continue
+                if new_freq < 0.5 or new_freq > 2.0:
+                    continue
+                probe["num_sa"] = new_sa
+                probe["freq_GHz"] = new_freq
+                label = f"trade-sa{new_sa}-f{new_freq}"
+                # Joint-trade bypasses surrogate gating: these are deliberately
+                # aggressive moves designed to escape local optima, and the
+                # surrogate (a learned roofline) often under-predicts their
+                # value in constrained non-convex regions.
+                result = _try_config(probe, "T", label, bypass_surrogate=True)
+                if result is not None:
+                    score, _ = result
+                    if score < trade_score:
+                        trade_cfg = probe
+                        trade_score = score
+                        print(f"    ↑ joint-trade improved!")
+
+            # HBM-saturation frontier sweep: when the current best runs at
+            # near-minimum frequency, the roofline indicates a memory-bound
+            # regime where HBM can absorb more compute. Probe the frontier by
+            # sweeping num_sa × sa_dim at freq=0.5, which classical roofline
+            # analysis predicts as the HBM-saturating design point.
+            if trade_cfg.get("freq_GHz", 1.0) <= 0.7:
+                print(f"  -- HBM-saturation frontier sweep (freq=0.5) --")
+                for sa_dim_val in [128, 256]:
+                    for target_sa in [8, 10, 12]:
+                        if total_sim_count >= max_refine_sims:
+                            break
+                        probe = dict(trade_cfg)
+                        probe["num_sa"] = target_sa
+                        probe["sa_dim"] = sa_dim_val
+                        probe["freq_GHz"] = 0.5
+                        label = f"hbmsat-sa{target_sa}-dim{sa_dim_val}"
+                        result = _try_config(probe, "H", label, bypass_surrogate=True)
+                        if result is not None:
+                            score, _ = result
+                            if score < trade_score:
+                                trade_cfg = probe
+                                trade_score = score
+                                print(f"    ↑ HBM-sat improved!")
+
     print(f"\n  Local refinement total: {total_sim_count} simulations across {n_starts} starts")
     return best_result, best_score
 
@@ -890,7 +952,7 @@ def run_design_loop(
     convergence_threshold: float = 0.02,
     convergence_window: int = 10,
     output_dir: str = "design_results",
-    openai_model: str = "gpt-4o",
+    openai_model: str = "gpt-5.4-mini",
     upper_bounds: dict[str, float] | None = None,
     ttft_weight: float = 0.5,
     tpot_weight: float = 0.5,
@@ -968,7 +1030,8 @@ def run_design_loop(
     print(f"{'='*60}\n")
 
     # ── Create online-learned roofline model ─────────────────────────────
-    learned_roofline = LearnedRoofline(ema_alpha=0.3)
+    _env_ema = float(os.environ.get("NPUAGENT_EMA_ALPHA", "0.3"))
+    learned_roofline = LearnedRoofline(ema_alpha=_env_ema)
 
     # ── Seed phase: evaluate diverse configs to map the design space ──────
     seed_history, best_result, best_score, baseline_ttft, baseline_tpot, best_seed_full = _run_seed_phase(
@@ -1476,8 +1539,8 @@ def main():
                         help="Consecutive iterations with <threshold change to converge (default: 10)")
     parser.add_argument("--output-dir", type=str, default="design_results",
                         help="Output directory for results")
-    parser.add_argument("--openai-model", type=str, default="gpt-4o",
-                        help="OpenAI model to use (default: gpt-4o)")
+    parser.add_argument("--openai-model", type=str, default="gpt-5.4-mini",
+                        help="OpenAI model to use (default: gpt-5.4-mini)")
     parser.add_argument("--max-hbm-bw", type=float, default=DEFAULT_UPPER_BOUNDS["hbm_bw_GBps"],
                         help=f"Upper bound for hbm_bw_GBps (default: {DEFAULT_UPPER_BOUNDS['hbm_bw_GBps']})")
     parser.add_argument("--max-hbm-size", type=float, default=DEFAULT_UPPER_BOUNDS["hbm_size_GB"],

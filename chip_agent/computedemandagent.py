@@ -952,15 +952,14 @@ class ComputeDemandAgent:
 
         print(f"  Calling OpenAI for {phase} phase...")
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             tools=TOOLS,
             tool_choice={"type": "function", "function": {"name": "compute_demand"}},
-            temperature=0.0,
-            max_tokens=16000,
+            max_completion_tokens=64000,
         )
 
         message = response.choices[0].message

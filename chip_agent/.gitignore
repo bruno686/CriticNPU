@@ -1,0 +1,63 @@
+# Secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Experiment artifacts (too large for git)
+experiment_480/
+experiment_ablation/
+experiment_ablation2/
+experiment_q3a/
+experiment_q3b/
+experiment_q3c/
+experiment_q3d/
+experiment_q3e/
+experiment_q3f/
+experiment_c16_pilot/
+
+# Per-run design results / CDA cache
+design_results/
+design_results_all/
+design_results_backbone/
+design_results_power_sweep/
+design_results_tp_sweep/
+design_results_wm/
+results/
+robustness_results/
+
+# Persistent memory (agent-specific cache)
+design_memory/
+
+# Analysis output dirs
+analysis_studies/
+anaysis_studies/
+
+# Outputs
+figures/
+*.png
+*.pdf
+*.tex
+*.log
+all_results.json
+imita/
+
+# Drafts / notes
+q1a_draft.md
+*.draft.md

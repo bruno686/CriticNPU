@@ -153,13 +153,12 @@ def generate_reflection(
     )
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.4-mini",
         messages=[
             {"role": "system", "content": REFLECTION_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.2,
-        max_tokens=200,
+        max_completion_tokens=400,
     )
     return response.choices[0].message.content
 
@@ -213,7 +212,7 @@ def consolidate_episodes(
         )
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.4-mini",
         messages=[
             {"role": "system", "content": CONSOLIDATION_PROMPT},
             {"role": "user", "content": (
@@ -221,8 +220,7 @@ def consolidate_episodes(
                 "\n\nExtract general principles (one per line, starting with '- ')."
             )},
         ],
-        temperature=0.2,
-        max_tokens=300,
+        max_completion_tokens=600,
     )
 
     text = response.choices[0].message.content

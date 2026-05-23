@@ -234,6 +234,29 @@ def run_simulation(
     # 10. Chip peak power from config
     total_power_peak_W = chip_config_obj.total_power_peak_W
 
+    # 11. Noise injection for robustness experiments (controlled by env var)
+    _noise_sigma = float(os.environ.get("NEUSIM_NOISE_SIGMA", "0.0"))
+    if _noise_sigma > 0:
+        import random as _rng
+        _noise_ttft = _rng.gauss(0, _noise_sigma)
+        _noise_tpot = _rng.gauss(0, _noise_sigma)
+        TTFT_sec *= max(0.1, 1 + _noise_ttft)
+        TPOT_ms_request *= max(0.1, 1 + _noise_tpot)
+        throughput_tokens_per_sec_request = (
+            1e3 / TPOT_ms_request if TPOT_ms_request > 0 else 0
+        )
+        # Also perturb per-operator execution times so bottleneck analysis sees noise
+        for _op in prefill_ops:
+            _op_noise = _rng.gauss(0, _noise_sigma)
+            _op.stats.execution_time_ns = int(
+                _op.stats.execution_time_ns * max(0.1, 1 + _op_noise)
+            )
+        for _op in decode_ops:
+            _op_noise = _rng.gauss(0, _noise_sigma)
+            _op.stats.execution_time_ns = int(
+                _op.stats.execution_time_ns * max(0.1, 1 + _op_noise)
+            )
+
     return {
         "TTFT_sec": TTFT_sec,
         "TPOT_ms_request": TPOT_ms_request,
