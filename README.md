@@ -1,13 +1,18 @@
-# CriticNPU: Roofline-Guided LLM Agent for NPU Architecture Design
+# CriticNPU: Mechanistic Critics for Sample-Efficient NPU Design-Space Exploration
 
-This repository contains the code for our NeurIPS 2026 submission
-**"Learning a Roofline World Model for NPU Architecture Design"**, together
-with the analytical NPU simulator the agent uses to validate its proposals.
+Official implementation of **"Mechanistic Critics for Sample-Efficient NPU
+Design-Space Exploration"**, accepted at **NeurIPS 2026**.
+
+**Authors:** Yicheng He, Yuqi Xue, Jerry Wu, Jian Huang, and Bin Hu
+
+**Affiliation:** University of Illinois Urbana-Champaign
 
 The system designs a custom NPU configuration for a given LLM inference workload
-(model, parallelism, batch size, power budget) and matches or beats classical
-DSE baselines (Bayesian Optimization, CMA-ES, Greedy, Grid) with roughly half
-the simulator budget.
+(model, parallelism, batch size, power budget). An online-calibrated mechanistic
+critic screens candidates before simulation and provides bottleneck-guided
+feedback afterward. Across six LLM workloads and 16 deployment settings per
+model, CriticNPU achieves best-or-tied-best latency in 74% of prefill and 87.5%
+of decode settings with roughly half the simulator calls of competitive baselines.
 
 ## Repository structure
 
@@ -35,13 +40,11 @@ the simulator budget.
 
 ### `chip_agent/` — CriticNPU and baselines
 
-A multi-agent LLM system that designs NPU architectures by combining
-GPT-driven proposals with an online-calibrated roofline world model.
-Three agents collaborate:
+A critic-guided search framework with three components:
 
-1. **Compute-Demand Agent** — extracts per-operator FLOPS / memory traffic from the model graph.
-2. **Bottleneck Agent** — reports one-sentence diagnosis after each simulation.
-3. **Design Agent (CriticNPU)** — proposes the next NPU configuration using the calibrated roofline to anchor each move to the currently-binding ceiling.
+1. **Compute Demand Agent** — extracts operator-level compute and memory demand from the LLM specification and deployment setting.
+2. **Online-Calibrated Roofline Critic** — filters weak candidates, summarizes compute, memory, and communication bottlenecks, and predicts the effect of parameter changes. The critic is deterministic; it does not make LLM calls.
+3. **Architecture Design Agent** — proposes the next NPU configuration using the workload, constraints, search history, and critic feedback.
 
 Comes with seven baselines: BO, CMA-ES, Greedy, Grid, ChatDSE, LLM-DSE, LLM-Box.
 
@@ -84,9 +87,9 @@ see the reproduction section of [chip_agent/README.md](chip_agent/README.md).
 
 ```
 @inproceedings{criticnpu2026,
-  title     = {Learning a Roofline World Model for NPU Architecture Design},
-  author    = {Anonymous},
-  booktitle = {Submitted to NeurIPS 2026},
+  title     = {Mechanistic Critics for Sample-Efficient {NPU} Design-Space Exploration},
+  author    = {He, Yicheng and Xue, Yuqi and Wu, Jerry and Huang, Jian and Hu, Bin},
+  booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026},
 }
 ```
