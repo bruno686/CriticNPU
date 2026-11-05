@@ -1,12 +1,5 @@
 # Mechanistic Critics for Sample-Efficient NPU Design-Space Exploration
 
-**CriticNPU · NeurIPS 2026**
-
-Yicheng He, Yuqi Xue, Jerry Wu, Jian Huang, Bin Hu<br>
-University of Illinois Urbana-Champaign
-
-[Quick start](#quick-start) · [Experiments](chip_agent/README.md) · [Citation](#citation)
-
 CriticNPU searches for NPU architectures tailored to LLM inference. An **online-calibrated mechanistic critic** screens configurations before simulation and turns operator-level feedback into guidance for the next design.
 
 ## Results
