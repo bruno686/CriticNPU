@@ -1,26 +1,11 @@
-<div align="center">
+# Mechanistic Critics for Sample-Efficient NPU Design-Space Exploration
 
-<h1>CriticNPU</h1>
-<h3>Mechanistic Critics for Sample-Efficient<br>NPU Design-Space Exploration</h3>
+**CriticNPU · NeurIPS 2026**
 
-<p>
-  <img src="https://img.shields.io/badge/NeurIPS_2026-Accepted-7c3aed?style=flat-square&amp;labelColor=18181b" alt="Accepted at NeurIPS 2026">
-  <img src="https://img.shields.io/badge/Python-3.12-0d9488?style=flat-square&amp;labelColor=18181b" alt="Python 3.12">
-</p>
+Yicheng He, Yuqi Xue, Jerry Wu, Jian Huang, Bin Hu<br>
+University of Illinois Urbana-Champaign
 
-<p>Yicheng He · Yuqi Xue · Jerry Wu · Jian Huang · Bin Hu<br>
-<sub>University of Illinois Urbana-Champaign</sub></p>
-
-<p>
-  <a href="#quick-start">Quick start</a> &nbsp;·&nbsp;
-  <a href="#method">Method</a> &nbsp;·&nbsp;
-  <a href="chip_agent/README.md#reproduce">Reproduction</a> &nbsp;·&nbsp;
-  <a href="#citation">Citation</a>
-</p>
-
-</div>
-
----
+[Quick start](#quick-start) · [Experiments](chip_agent/README.md) · [Citation](#citation)
 
 CriticNPU searches for NPU architectures tailored to LLM inference. An **online-calibrated mechanistic critic** screens configurations before simulation and turns operator-level feedback into guidance for the next design.
 
@@ -34,11 +19,9 @@ Across **6 LLMs × 16 deployment settings**, win rate measures best-or-tied-best
 
 ## Method
 
-| Component | Role |
-| --- | --- |
-| **Compute Demand Agent** | Extracts operator-level compute and memory demand from the model and deployment setting. |
-| **Mechanistic Critic** | Calibrates Roofline limits, filters weak candidates, diagnoses compute/HBM/communication bottlenecks, and predicts parameter-change effects. |
-| **Architecture Design Agent** | Proposes NPU configurations using the workload, constraints, search history, and critic feedback. |
+1. **Compute Demand Agent** extracts operator-level compute and memory demand from the model and deployment setting.
+2. **Mechanistic Critic** calibrates Roofline limits, screens candidates, and diagnoses compute, HBM, and communication bottlenecks.
+3. **Architecture Design Agent** proposes the next configuration using the workload, constraints, history, and critic predictions.
 
 The critic uses deterministic calculations; the agents use an LLM. **NeuSIM** evaluates candidate latency, power, and memory usage. Prefill and decode architectures are optimized separately for **TTFT** and **TPOT**.
 
@@ -76,7 +59,7 @@ python main.py llama3-8b \
     --disaggregated
 ```
 
-→ [Experiment guide](chip_agent/README.md) · [Full reproduction](chip_agent/README.md#reproduce)
+See the [experiment guide](chip_agent/README.md) for baseline comparisons, parameters, and full reproduction.
 
 ## Repository
 
