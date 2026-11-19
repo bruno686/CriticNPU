@@ -66,10 +66,13 @@ See the [experiment guide](chip_agent/README.md) for baseline comparisons, param
 ## Citation
 
 ```bibtex
-@inproceedings{criticnpu2026,
-  title     = {Mechanistic Critics for Sample-Efficient {NPU} Design-Space Exploration},
-  author    = {He, Yicheng and Xue, Yuqi and Wu, Jerry and Huang, Jian and Hu, Bin},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2026}
+@misc{he2026mechanisticcriticssampleefficientnpu,
+      title={Mechanistic Critics for Sample-Efficient NPU Design-Space Exploration}, 
+      author={Yicheng He and Yuqi Xue and Tianyang Wu and Jian Huang and Bin Hu},
+      year={2026},
+      eprint={2611.24733},
+      archivePrefix={arXiv},
+      primaryClass={cs.AR},
+      url={https://arxiv.org/abs/2611.24733}, 
 }
 ```
